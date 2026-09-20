@@ -17,13 +17,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoConfig
+from transformers import AutoConfig, SiglipConfig
 from torch.nn.attention.flex_attention import BlockMask
 from .misc import velocity_prediction, next_token_prediction, interpolate_pos_encoding
 from .modeling_siglip import SiglipModel
 from .modeling_utils import ConfigMixin, ModelMixin, register_to_config
 from .modules import DiffusionHeadConfig
 from .modules import ModulatedAttentionBlock, RMSNorm, PatchEmbed, TimestepEmbedder, FinalLayer
+from .position_utils import position_table_matches_grid
 from .qwen2 import Qwen2ForCausalLM
 
 
@@ -54,6 +55,10 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
 
         llm_config = AutoConfig.from_pretrained(llm_model_path)
         if load_from_showo:
+            # Keep long interleaved sequences on the repository's supported
+            # SDPA path; constructing Qwen2 directly otherwise defaults to
+            # eager attention and needlessly materializes dense attention.
+            llm_config._attn_implementation = 'sdpa'
             self.showo = Qwen2ForCausalLM(llm_config)
         else:
             self.showo = Qwen2ForCausalLM.from_pretrained(llm_model_path, attn_implementation='sdpa')
@@ -74,7 +79,15 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
         )
 
         # initialize semantic layers from siglip
-        siglip_model = SiglipModel.from_pretrained(clip_pretrained_model_path)
+        if load_from_showo:
+            # The Show-o2 checkpoint contains the retained SigLIP position table
+            # and encoder weights. Build only the module structure from config;
+            # from_pretrained strictly loads the checkpoint state below, avoiding
+            # a redundant download of the full SigLIP weights.
+            siglip_config = SiglipConfig.from_pretrained(clip_pretrained_model_path)
+            siglip_model = SiglipModel(siglip_config)
+        else:
+            siglip_model = SiglipModel.from_pretrained(clip_pretrained_model_path)
         self.position_embedding = siglip_model.vision_model.embeddings.position_embedding
         self.und_trans = siglip_model.vision_model.encoder
         del self.und_trans.layers[-1]
@@ -199,9 +212,12 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
         # go through semantic layers
         p = self.config.patch_size
         h_, w_ = h // p, w // p
-        # specific for fixed resolution of 432x432
-        if self.position_embedding.weight.shape[0] == self.image_position_ids.shape[-1]:
-            image_embeds_und = image_embeds_und + self.position_embedding(self.image_position_ids)
+        # Use the checkpoint's table directly only when its length matches the
+        # actual patch grid. In particular, the 27x27 released table must be
+        # interpolated for the 28x28 grid used by 448px Seen-10 images.
+        if position_table_matches_grid(self.position_embedding, h_, w_):
+            position_ids = torch.arange(h_ * w_, device=image_embeds_und.device).view(1, -1)
+            image_embeds_und = image_embeds_und + self.position_embedding(position_ids)
             image_embeds_und = self.und_trans(image_embeds_und)['last_hidden_state']
         # interpolate position embeddings for dynamic resolution
         else:
@@ -304,9 +320,11 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
             # go through semantic layers
             p = self.config.patch_size
             h_, w_ = h // p, w // p
-            # specific for fixed resolution of 432x432
-            if self.position_embedding.weight.shape[0] == self.image_position_ids.shape[-1]:
-                image_embeds_und = image_embeds_und + self.position_embedding(self.image_position_ids)
+            # Match the table to the actual patch grid so 448px inputs take the
+            # interpolation path when loaded from the 27x27 Show-o2 checkpoint.
+            if position_table_matches_grid(self.position_embedding, h_, w_):
+                position_ids = torch.arange(h_ * w_, device=image_embeds_und.device).view(1, -1)
+                image_embeds_und = image_embeds_und + self.position_embedding(position_ids)
                 image_embeds_und = self.und_trans(image_embeds_und)['last_hidden_state']
             # interpolate position embeddings for dynamic resolution
             else:

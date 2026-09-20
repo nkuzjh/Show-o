@@ -1,0 +1,73 @@
+benchmark:
+  id: csgo_benchmark_v2
+  data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+
+output_root: outputs/csgo_benchmark_v2_seen10/Show-o2-1.5B
+
+model:
+  vae_model:
+    type: wan21
+    pretrained_model_path: checkpoints/Wan2.1_VAE.pth
+  showo:
+    model_name: Showo2
+    load_from_showo: true
+    pretrained_model_path: checkpoints/show-o2-1.5B
+    llm_model_path: checkpoints/Qwen2.5-1.5B-Instruct
+    image_latent_dim: 16
+    image_latent_height: 28
+    image_latent_width: 28
+    patch_size: 2
+    add_time_embeds: true
+  clip:
+    config_path: checkpoints/siglip-so400m-patch14-384
+
+dataset:
+  resolution: 448
+  max_seq_length: 1664
+  max_prompt_tokens: 64
+  num_workers: 6
+  pin_memory: true
+  persistent_workers: true
+  validation_samples_per_map: 10
+
+optimizer:
+  learning_rate: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.0
+  epsilon: 1.0e-8
+
+lr_scheduler:
+  name: constant_with_warmup
+  warmup_steps: 500
+
+training:
+  seed: 0
+  mixed_precision: bf16
+  enable_tf32: true
+  max_train_steps: 50000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  log_every: 20
+  validation_milestones: 5
+  smoke_validation_samples: 1
+
+transport:
+  path_type: Linear
+  prediction: velocity
+  loss_weight: null
+  train_eps: null
+  sample_eps: null
+  snr_type: lognorm
+  do_shift: true
+  sampling_method: euler
+  num_inference_steps: 28
+  atol: 1.0e-6
+  rtol: 1.0e-3
+  time_shifting_factor: 3.0
+  guidance_scale: 0.0
+
+inference:
+  seed: 42
+  max_samples: null

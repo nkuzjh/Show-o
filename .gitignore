@@ -1,0 +1,7 @@
+# Show-o2 CSGO Seen-10 environment, model assets, and generated outputs
+/show-o2/.venv/
+/show-o2/.hf_cache/
+/show-o2/checkpoints/
+outputs/
+__pycache__/
+*.py[cod]
