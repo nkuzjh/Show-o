@@ -19,6 +19,7 @@ Options:
   --seed N                 Training seed (default: 0)
   --inference-seed N       Generation RNG seed (default: config value, 42)
   --task all|discrete|continuous (default: all)
+  --batch-size N           Inference batch size (default: config value, 16)
   --output-root PATH       Seed output root (default: configured project output)
   --checkpoint PATH|best|late|latest (default: best)
   --resume [best|late|latest|PATH]
@@ -42,6 +43,7 @@ OUTPUT_ROOT=""
 CHECKPOINT=best
 RESUME=""
 LIMIT=""
+BATCH_SIZE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --seed)
@@ -64,6 +66,9 @@ while [[ $# -gt 0 ]]; do
         --limit)
             [[ $# -ge 2 ]] || { echo "--limit needs a value" >&2; exit 2; }
             LIMIT="$2"; shift 2 ;;
+        --batch-size)
+            [[ $# -ge 2 ]] || { echo "--batch-size needs a value" >&2; exit 2; }
+            BATCH_SIZE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -87,12 +92,14 @@ run_infer() {
     local root="$1"
     local limit_arg=()
     [[ -z "${LIMIT}" ]] || limit_arg=(--limit "${LIMIT}")
+    local batch_size_arg=()
+    [[ -z "${BATCH_SIZE}" ]] || batch_size_arg=(--batch-size "${BATCH_SIZE}")
     local infer_seed_arg=()
     [[ -z "${INFERENCE_SEED}" ]] || infer_seed_arg=(--inference-seed "${INFERENCE_SEED}")
     "${PYTHON}" "${SHOWO2_DIR}/infer_seen10.py" \
         --config "${CONFIG}" --seed "${SEED}" --data-root "${DATA_ROOT}" \
         --output-root "${root}" --checkpoint "${CHECKPOINT}" --task "${TASK}" \
-        "${infer_seed_arg[@]}" "${limit_arg[@]}"
+        "${infer_seed_arg[@]}" "${limit_arg[@]}" "${batch_size_arg[@]}"
 }
 
 run_smoke_eval() {

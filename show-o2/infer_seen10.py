@@ -11,14 +11,14 @@ from omegaconf import OmegaConf
 
 from csgo_seen10.data import CSGOSeen10Dataset, declared_sample_counts
 from csgo_seen10.runtime import (
-    generate_one,
+    Seen10InferenceConditionCache,
+    generate_batch,
     create_transport_and_sampler,
     is_valid_output,
     load_finetune_weights,
     load_runtime,
     resolve_project_path,
     save_rgb_jpeg,
-    single_sample_batch,
     write_inference_manifest,
 )
 
@@ -27,6 +27,7 @@ INFERENCE_RNG_STRATEGY = (
     "per-sample torch.Generator(device).manual_seed(inference_seed + manifest_index); "
     "manifest_index is zero-based dataset row order"
 )
+INFERENCE_ALGORITHM = "showo2_seen10_native_batch_v1"
 
 
 def _args() -> argparse.Namespace:
@@ -40,6 +41,12 @@ def _args() -> argparse.Namespace:
         "--checkpoint", default="best", help="Checkpoint directory or best/late/latest alias"
     )
     parser.add_argument("--task", choices=("all", "discrete", "continuous"), default="all")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Inference batch size (default: inference.batch_size from config)",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional prefix limit per selected task")
     parser.add_argument("--smoke-only", action="store_true")
     return parser.parse_args()
@@ -55,7 +62,14 @@ def _checkpoint_path(value: str, output_root: Path) -> Path:
     return checkpoint.resolve(strict=True)
 
 
-def _inference_settings(config: Any) -> Dict[str, Any]:
+def _configured_batch_size(config: Any) -> int:
+    inference = config.get("inference", {})
+    return int(inference.get("batch_size", 16))
+
+
+def _inference_settings(config: Any, batch_size: Optional[int] = None) -> Dict[str, Any]:
+    if batch_size is None:
+        batch_size = _configured_batch_size(config)
     return {
         "resolution": int(config.dataset.resolution),
         "max_seq_length": int(config.dataset.max_seq_length),
@@ -66,6 +80,14 @@ def _inference_settings(config: Any) -> Dict[str, Any]:
         "rtol": float(config.transport.rtol),
         "time_shifting_factor": float(config.transport.time_shifting_factor),
         "guidance_scale": float(config.transport.guidance_scale),
+        "batch_size": int(batch_size),
+        "generation_algorithm": INFERENCE_ALGORITHM,
+        "ode_implementation": (
+            "explicit_euler_final_v1"
+            if str(config.transport.sampling_method).lower() == "euler"
+            else "torchdiffeq"
+        ),
+        "condition_cache": "one preprocessed radar latent and sequence template per map; pose per sample",
         "rng_strategy": INFERENCE_RNG_STRATEGY,
     }
 
@@ -75,6 +97,23 @@ def _sample_seed(inference_seed: int, manifest_index: int) -> int:
     if manifest_index < 0:
         raise ValueError("manifest_index must be non-negative")
     return int(inference_seed) + int(manifest_index)
+
+
+def iter_manifest_batches(dataset: CSGOSeen10Dataset, batch_size: int) -> Iterable[list[int]]:
+    """Yield stable batch blocks without crossing map boundaries."""
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    rows = dataset.rows
+    map_start = 0
+    while map_start < len(rows):
+        map_name = rows[map_start]["map_name"]
+        map_end = map_start + 1
+        while map_end < len(rows) and rows[map_end]["map_name"] == map_name:
+            map_end += 1
+        for start in range(map_start, map_end, batch_size):
+            yield list(range(start, min(start + batch_size, map_end)))
+        map_start = map_end
 
 
 def _run_task(
@@ -93,6 +132,8 @@ def _run_task(
     checkpoint_dir: Path,
     train_seed: int,
     inference_seed: int,
+    batch_size: int,
+    condition_cache: Seen10InferenceConditionCache,
     limit: Optional[int],
     smoke_only: bool,
     config_path: Path,
@@ -114,7 +155,7 @@ def _run_task(
         task_root,
         project_root=project_root,
         config_path=config_path,
-        inference_settings=_inference_settings(config),
+        inference_settings=_inference_settings(config, batch_size),
         showo_path=showo_path,
         vae_path=vae_path,
         checkpoint_dir=checkpoint_dir,
@@ -129,19 +170,26 @@ def _run_task(
 
     generated = 0
     preserved = 0
-    for index, row in enumerate(dataset.rows):
-        map_name = row["map_name"]
-        file_frame = row["file_frame"]
-        destination = prediction_root / map_name / f"{file_frame}.jpg"
-        if is_valid_output(destination):
-            preserved += 1
-        else:
-            batch = single_sample_batch(dataset[index])
-            image = generate_one(
+    processed = 0
+    for indices in iter_manifest_batches(dataset, batch_size):
+        rows = [dataset.rows[index] for index in indices]
+        destinations = [
+            prediction_root / row["map_name"] / f"{row['file_frame']}.jpg"
+            for row in rows
+        ]
+        missing = [not is_valid_output(destination) for destination in destinations]
+        preserved += sum(not needs_generation for needs_generation in missing)
+        if any(missing):
+            radar_latents, model_inputs = condition_cache.prepare_batch(dataset, indices)
+            generators = [
+                torch.Generator(device=str(device)).manual_seed(_sample_seed(inference_seed, index))
+                for index in indices
+            ]
+            images = generate_batch(
                 model,
                 vae,
                 sampler,
-                batch,
+                {"map_name": [row["map_name"] for row in rows]},
                 tokenizer,
                 token_ids,
                 device=device,
@@ -154,17 +202,21 @@ def _run_task(
                 rtol=float(config.transport.rtol),
                 time_shifting_factor=float(config.transport.time_shifting_factor),
                 guidance_scale=float(config.transport.guidance_scale),
-                generator=torch.Generator(device=str(device)).manual_seed(
-                    _sample_seed(inference_seed, index)
-                ),
+                generators=generators,
+                radar_latents=radar_latents,
+                model_inputs=model_inputs,
             )
-            if save_rgb_jpeg(image, destination, skip_valid=True):
-                generated += 1
-            else:
-                preserved += 1
-        if (index + 1) % 50 == 0 or index + 1 == len(dataset):
+            for image, destination, needs_generation in zip(images, destinations, missing):
+                if needs_generation:
+                    if save_rgb_jpeg(image, destination, skip_valid=True):
+                        generated += 1
+                    else:
+                        preserved += 1
+        processed += len(indices)
+        previous_processed = processed - len(indices)
+        if processed // 50 > previous_processed // 50 or processed == len(dataset):
             print(
-                f"{task}: {index + 1}/{len(dataset)} processed "
+                f"{task}: {processed}/{len(dataset)} processed "
                 f"(generated={generated}, preserved_valid={preserved})",
                 flush=True,
             )
@@ -173,7 +225,7 @@ def _run_task(
         task_root,
         project_root=project_root,
         config_path=config_path,
-        inference_settings=_inference_settings(config),
+        inference_settings=_inference_settings(config, batch_size),
         showo_path=showo_path,
         vae_path=vae_path,
         checkpoint_dir=checkpoint_dir,
@@ -203,6 +255,9 @@ def main() -> None:
     inference_seed = int(config.inference.seed if args.inference_seed is None else args.inference_seed)
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive")
+    batch_size = _configured_batch_size(config) if args.batch_size is None else int(args.batch_size)
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     if float(config.transport.guidance_scale) != 0.0:
         raise ValueError("Seen-10 inference uses a single conditioned pass; guidance_scale must be 0")
 
@@ -224,6 +279,15 @@ def main() -> None:
         raise RuntimeError(f"Unexpected missing official weights: {loading_info['missing_keys']}")
     load_finetune_weights(model, checkpoint_dir)
     transport, sampler = create_transport_and_sampler(config)
+    condition_cache = Seen10InferenceConditionCache(
+        vae=vae,
+        tokenizer=tokenizer,
+        token_ids=token_ids,
+        device=device,
+        weight_dtype=weight_dtype,
+        max_seq_length=int(config.dataset.max_seq_length),
+        max_prompt_tokens=int(config.dataset.max_prompt_tokens),
+    )
 
     showo_path = resolve_project_path(config.model.showo.pretrained_model_path, showo_dir)
     vae_path = resolve_project_path(config.model.vae_model.pretrained_model_path, showo_dir)
@@ -255,6 +319,8 @@ def main() -> None:
             checkpoint_dir=checkpoint_dir,
             train_seed=train_seed,
             inference_seed=inference_seed,
+            batch_size=batch_size,
+            condition_cache=condition_cache,
             limit=task_limit,
             smoke_only=task_is_smoke,
             config_path=config_path.resolve(),

@@ -70,4 +70,5 @@ transport:
 
 inference:
   seed: 42
+  batch_size: 16
   max_samples: null

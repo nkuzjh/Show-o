@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .acceleration import interleave_pairs
 from .data import CSGOSeen10Dataset, MAPS, sha256_file
 from .model import CSGOSeen10Model, load_showo2_seen10
 
@@ -265,6 +266,88 @@ def move_model_inputs(
     }
 
 
+class Seen10InferenceConditionCache:
+    """Cache map-static radar latents and sequence templates across inference tasks."""
+
+    def __init__(
+        self,
+        *,
+        vae: Any,
+        tokenizer: Any,
+        token_ids: Mapping[str, int],
+        device: torch.device,
+        weight_dtype: torch.dtype,
+        max_seq_length: int,
+        max_prompt_tokens: int,
+    ) -> None:
+        self.vae = vae
+        self.tokenizer = tokenizer
+        self.token_ids = dict(token_ids)
+        self.device = device
+        self.weight_dtype = weight_dtype
+        self.max_seq_length = int(max_seq_length)
+        self.max_prompt_tokens = int(max_prompt_tokens)
+        self._radar_tensors: Dict[str, torch.Tensor] = {}
+        self._radar_latents: Dict[str, torch.Tensor] = {}
+        self._model_inputs: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def _load_radar(self, dataset: CSGOSeen10Dataset, index: int, map_name: str) -> None:
+        if map_name in self._radar_latents:
+            return
+        sample = dataset.get_condition_only(index)
+        radar_cpu = sample["radar"].detach().cpu()
+        radar = radar_cpu.unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+        latent = encode_images(self.vae, radar, deterministic=True)[0].detach()
+        self._radar_tensors[map_name] = radar_cpu
+        self._radar_latents[map_name] = latent
+
+    def _get_model_inputs(self, map_name: str) -> Dict[str, torch.Tensor]:
+        if map_name not in self._model_inputs:
+            text_tokens, modality_positions, image_masks, attention_mask = build_interleaved_inputs(
+                {"map_name": [map_name]},
+                self.tokenizer,
+                self.token_ids,
+                device=self.device,
+                max_seq_length=self.max_seq_length,
+                max_prompt_tokens=self.max_prompt_tokens,
+            )
+            self._model_inputs[map_name] = {
+                "text_tokens": text_tokens,
+                "modality_positions": modality_positions,
+                "image_masks": image_masks,
+                "attention_mask": attention_mask.to(dtype=self.weight_dtype),
+            }
+        return self._model_inputs[map_name]
+
+    def prepare_batch(
+        self,
+        dataset: CSGOSeen10Dataset,
+        indices: Sequence[int],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Build a same-map model batch without rereading radar or retokenizing."""
+        if not indices:
+            raise ValueError("Cannot prepare an empty inference batch")
+        rows = [dataset.rows[int(index)] for index in indices]
+        map_names = {str(row["map_name"]) for row in rows}
+        if len(map_names) != 1:
+            raise ValueError("Inference batches must not cross map boundaries")
+        map_name = next(iter(map_names))
+        self._load_radar(dataset, int(indices[0]), map_name)
+        radar_latent = self._radar_latents[map_name]
+        radar_latents = radar_latent.unsqueeze(0).expand(len(indices), *radar_latent.shape).contiguous()
+
+        model_inputs: Dict[str, torch.Tensor] = {}
+        for name, value in self._get_model_inputs(map_name).items():
+            model_inputs[name] = value.expand(len(indices), *value.shape[1:])
+        model_inputs["radar_pose"] = torch.stack([row["pose"] for row in rows]).to(
+            device=self.device, dtype=torch.float32
+        )
+        model_inputs["map_ids"] = torch.tensor(
+            [int(row["map_id"]) for row in rows], device=self.device, dtype=torch.long
+        )
+        return radar_latents, model_inputs
+
+
 def pil_from_model_tensor(image: torch.Tensor) -> Image.Image:
     image = image.detach().float()
     if image.ndim != 3 or image.shape[0] != 3:
@@ -305,6 +388,156 @@ def is_valid_output(path: str | Path) -> bool:
 
 
 @torch.no_grad()
+def noise_for_generators(
+    latent_batch: torch.Tensor,
+    generators: Sequence[torch.Generator],
+) -> torch.Tensor:
+    """Draw each sample with its own generator, independent of batching/resume order."""
+    if latent_batch.ndim < 2:
+        raise ValueError(f"Expected latent batch [B,...], got {tuple(latent_batch.shape)}")
+    if len(generators) != latent_batch.shape[0]:
+        raise ValueError(
+            f"Expected one generator per sample ({latent_batch.shape[0]}), got {len(generators)}"
+        )
+    return torch.cat(
+        [
+            torch.randn(
+                (1, *latent_batch.shape[1:]),
+                generator=generator,
+                device=latent_batch.device,
+                dtype=latent_batch.dtype,
+            )
+            for generator in generators
+        ],
+        dim=0,
+    )
+
+
+@torch.no_grad()
+def explicit_euler_final(
+    initial: torch.Tensor,
+    model_fn: Any,
+    sampler: Any,
+    *,
+    num_steps: int,
+    time_shifting_factor: float,
+    model_kwargs: Mapping[str, Any],
+) -> torch.Tensor:
+    """Run the same shifted fixed Euler grid as ``torchdiffeq`` without storing all states."""
+    num_steps = int(num_steps)
+    if num_steps < 2:
+        raise ValueError("Euler integration requires at least two time points")
+    transport = sampler.transport
+    t0, t1 = transport.check_interval(
+        transport.train_eps,
+        transport.sample_eps,
+        sde=False,
+        eval=True,
+        reverse=False,
+        last_step_size=0.0,
+    )
+    times = torch.linspace(t0, t1, num_steps)
+    if time_shifting_factor:
+        factor = float(time_shifting_factor)
+        times = times / (times + factor - factor * times)
+
+    x = initial.float()
+    times = times.to(x.device)
+    for index in range(num_steps - 1):
+        t = torch.ones(x.size(0)).to(x.device) * times[index]
+        drift = sampler.drift(x, t, model_fn, **model_kwargs).float()
+        x = x + (times[index + 1] - times[index]) * drift
+    return x
+
+
+@torch.no_grad()
+def generate_batch(
+    model: CSGOSeen10Model,
+    vae: Any,
+    sampler: Any,
+    batch: Mapping[str, Any],
+    tokenizer: Any,
+    token_ids: Mapping[str, int],
+    *,
+    device: torch.device,
+    weight_dtype: torch.dtype,
+    max_seq_length: int,
+    max_prompt_tokens: int = 64,
+    num_inference_steps: int,
+    sampling_method: str,
+    atol: float,
+    rtol: float,
+    time_shifting_factor: float,
+    guidance_scale: float,
+    generators: Sequence[torch.Generator],
+    radar_latents: Optional[torch.Tensor] = None,
+    model_inputs: Optional[Mapping[str, torch.Tensor]] = None,
+) -> List[Image.Image]:
+    batch_size = len(generators)
+    if batch_size <= 0:
+        raise ValueError("Inference batch must contain at least one sample")
+    if float(guidance_scale) != 0.0:
+        raise ValueError("Seen-10 builds one conditioned sequence; guidance_scale must be 0")
+    if radar_latents is None:
+        radar = batch["radar"].to(device=device, dtype=weight_dtype)
+        radar_latents = encode_images(vae, radar, deterministic=True)
+    else:
+        radar_latents = radar_latents.to(device=device, dtype=torch.float32)
+    if radar_latents.shape[0] != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} radar latents, got {radar_latents.shape[0]}"
+        )
+    noise = noise_for_generators(radar_latents, generators)
+    initial_latents = interleave_pairs(radar_latents, noise)
+    if model_inputs is None:
+        model_inputs = move_model_inputs(
+            batch,
+            tokenizer,
+            token_ids,
+            device=device,
+            max_seq_length=max_seq_length,
+            weight_dtype=weight_dtype,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+    model_kwargs = {
+        **model_inputs,
+        "max_seq_len": model_inputs["text_tokens"].shape[1],
+        "guidance_scale": float(guidance_scale),
+        "only_denoise_last_image": True,
+        "pairwise_conditioning": True,
+        "generation_backbone_only": True,
+    }
+    model.eval()
+    with autocast_context(device, weight_dtype):
+        if str(sampling_method).lower() == "euler":
+            generated = explicit_euler_final(
+                initial_latents,
+                model.t2i_generate,
+                sampler,
+                num_steps=int(num_inference_steps),
+                time_shifting_factor=float(time_shifting_factor),
+                model_kwargs=model_kwargs,
+            )
+        else:
+            sample_fn = sampler.sample_ode(
+                sampling_method=sampling_method,
+                num_steps=int(num_inference_steps),
+                atol=float(atol),
+                rtol=float(rtol),
+                reverse=False,
+                time_shifting_factor=float(time_shifting_factor),
+            )
+            generated = sample_fn(initial_latents, model.t2i_generate, **model_kwargs)[-1]
+    paired_latents = generated.reshape(batch_size, 2, *generated.shape[1:])
+    target_latents = paired_latents[:, 1].unsqueeze(2)
+    decoded = vae.batch_decode(target_latents)
+    if decoded.ndim != 5 or decoded.shape[0] != batch_size or decoded.shape[2] != 1:
+        raise RuntimeError(f"WanVAE returned an unexpected decoded shape: {tuple(decoded.shape)}")
+    decoded = decoded.squeeze(2)
+    return [pil_from_model_tensor(decoded[index]) for index in range(batch_size)]
+
+
+@torch.no_grad()
 def generate_one(
     model: CSGOSeen10Model,
     vae: Any,
@@ -325,49 +558,28 @@ def generate_one(
     guidance_scale: float,
     generator: torch.Generator,
 ) -> Image.Image:
+    """Backward-compatible single-sample generation wrapper."""
     if len(batch["map_name"]) != 1:
-        raise ValueError("Native Show-o2 only_denoise_last_image supports inference batch size exactly 1")
-    if float(guidance_scale) != 0.0:
-        raise ValueError("Seen-10 builds one conditioned sequence; guidance_scale must be 0")
-    radar = batch["radar"].to(device=device, dtype=weight_dtype)
-    radar_latent = encode_images(vae, radar, deterministic=True)
-    noise = torch.randn(
-        radar_latent.shape,
-        generator=generator,
-        device=device,
-        dtype=radar_latent.dtype,
-    )
-    initial_latents = torch.cat([radar_latent, noise], dim=0)
-    model_inputs = move_model_inputs(
+        raise ValueError("generate_one expects exactly one sample; use generate_batch for batches")
+    return generate_batch(
+        model,
+        vae,
+        sampler,
         batch,
         tokenizer,
         token_ids,
         device=device,
-        max_seq_length=max_seq_length,
         weight_dtype=weight_dtype,
+        max_seq_length=max_seq_length,
         max_prompt_tokens=max_prompt_tokens,
-    )
-    model_kwargs = {
-        **model_inputs,
-        "max_seq_len": model_inputs["text_tokens"].shape[1],
-        "guidance_scale": float(guidance_scale),
-        "only_denoise_last_image": True,
-        "output_hidden_states": True,
-    }
-    sample_fn = sampler.sample_ode(
+        num_inference_steps=num_inference_steps,
         sampling_method=sampling_method,
-        num_steps=int(num_inference_steps),
-        atol=float(atol),
-        rtol=float(rtol),
-        reverse=False,
-        time_shifting_factor=float(time_shifting_factor),
-    )
-    model.eval()
-    with autocast_context(device, weight_dtype):
-        generated = sample_fn(initial_latents, model.t2i_generate, **model_kwargs)[-1]
-    target_latent = generated[-1:].unsqueeze(2)
-    decoded = vae.batch_decode(target_latent).squeeze(0).squeeze(1)
-    return pil_from_model_tensor(decoded)
+        atol=atol,
+        rtol=rtol,
+        time_shifting_factor=time_shifting_factor,
+        guidance_scale=guidance_scale,
+        generators=[generator],
+    )[0]
 
 
 def single_sample_batch(sample: Mapping[str, Any]) -> Dict[str, Any]:

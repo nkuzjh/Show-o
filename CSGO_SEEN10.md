@@ -43,6 +43,17 @@ The unified runner also accepts `--task discrete` or `--task continuous` and
 `DATA_ROOT` may be overridden in the environment. The inference RNG defaults
 to seed 42; the training seed selects the output directory.
 
+Full inference uses a fixed batch size of 16 by default. The existing command
+above remains valid and picks up this default. Set `--batch-size N` to choose a
+different inference batch size, for example:
+
+```bash
+bash scripts/run_csgo_seen10.sh infer --seed 0 --checkpoint best --task all --batch-size 8
+```
+
+This setting affects generation throughput only; training batch size and the
+shared evaluator are unchanged. The one-sample smoke path also remains valid.
+
 ### Direct entry points
 
 The commands wrapped by `run_csgo_seen10.sh` are, from the project root:
@@ -62,8 +73,13 @@ cd /home/jiahao/task/Show-o/show-o2
   --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
   --output-root /home/jiahao/task/Show-o/outputs/csgo_benchmark_v2_seen10/Show-o2-1.5B/seed_0 \
   --checkpoint best \
-  --task all
+  --task all \
+  --batch-size 16
 ```
+
+`--batch-size` is optional; omitting it uses 16. The same option is available
+on the unified runner, while existing inference commands that do not specify
+it continue to work.
 
 The corresponding direct shared-evaluator commands are:
 
@@ -109,6 +125,53 @@ smoke run uses a timestamped separate output root and is explicitly marked
 The configured formal schedule is 50,000 optimizer steps with validation and
 checkpoint milestones at 10,000-step intervals. Full generation coverage is
 20,000 discrete and 12,800 continuous images.
+
+## Inference acceleration (without compilation)
+
+The inference implementation uses the following four optimizations. They
+preserve the benchmark inputs, the configured 28-point Euler time grid, and the
+training and evaluation protocols. No `torch.compile` path or reduced-step
+sampling is used.
+
+1. **Fixed batches (default 16).** The old invocation remains supported; its
+   omitted `--batch-size` now selects 16, and `--batch-size N` overrides it.
+   Each example is packed as an interleaved `(radar, target)` latent pair. Its
+   timesteps are `(1, t_i)`, and only that example's target velocity is kept.
+   Generate the initial noise with the existing per-row seed
+   `inference_seed + manifest_index`, then stack samples in manifest order.
+   Resume uses stable, map-local manifest blocks. If a block contains any
+   missing output, the block is recomputed with its original manifest indices,
+   but only missing JPEGs are written; valid JPEGs are never overwritten.
+   Formal per-map counts are divisible by 16, while a partial/smoke tail uses
+   its actual size. Decode generated target latents as a batch. This keeps each
+   sample's random input independent of resume state and preserves interrupted
+   run behavior.
+
+2. **Skip unused language-model outputs.** The image-only generation path
+   consumes the final transformer hidden state for the diffusion head, not
+   next-token logits or the full tuple of intermediate hidden states. Avoid
+   calculating the full vocabulary logits and retaining intermediate states on
+   each denoising evaluation while supplying the same final state to the
+   diffusion head.
+
+3. **Cache map-specific inputs.** There are ten fixed radar maps. Encode each
+   map's radar once with the deterministic VAE path and reuse its latent for
+   every corresponding row. Cache the map prompt tokens and the matching
+   modality positions, image mask, and attention-mask template as well. Pose
+   conditioning remains per sample.
+
+4. **Use an explicit fixed Euler loop.** Reproduce the configured shifted
+   28-point time grid and Euler updates, retaining only the current latent and
+   final result instead of the sampler's full trajectory. This reduces
+   trajectory storage without changing the number or placement of time points.
+
+The per-row noise seed and manifest ordering are independent of batch size.
+Existing valid RGB 448x448 JPEGs are still skipped on resume. As with ordinary
+batched inference, changing batch size can produce small floating-point
+differences from a separate batch-size-1 run; outputs remain deterministic for
+the same run settings and sample seeds. The inference manifest records the
+batch size and generation algorithm and rejects mixing outputs produced with
+different settings in one output root.
 
 ## Verified smoke
 

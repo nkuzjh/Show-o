@@ -26,6 +26,7 @@ from .modules import DiffusionHeadConfig
 from .modules import ModulatedAttentionBlock, RMSNorm, PatchEmbed, TimestepEmbedder, FinalLayer
 from .position_utils import position_table_matches_grid
 from .qwen2 import Qwen2ForCausalLM
+from csgo_seen10.acceleration import keep_pair_targets_only, pair_timesteps_with_clean_condition
 
 
 class Showo2Qwen2_5(ModelMixin, ConfigMixin):
@@ -281,8 +282,10 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
             modality_positions=None,
             first_frame_as_cond=False,
             only_denoise_last_image=False,
+            pairwise_conditioning=False,
             guidance_scale=0.0,
             output_hidden_states=True,
+            generation_backbone_only=False,
             max_seq_len=None,
             device='cuda:0',
             **kwargs,
@@ -388,14 +391,24 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
                             new_image_labels[i, offset:offset + length] = image_labels[
                                                                           i * modality_positions.size(1) + j, :length]
 
-            outputs = self.showo(
-                inputs_embeds=input_embeds,
-                attention_mask=attention_mask,
-                # position_ids=position_ids,
-                output_hidden_states=output_hidden_states
-            )
-
-            logits, last_hidden_states = outputs['logits'], outputs['hidden_states'][-1]
+            if generation_backbone_only and text_labels is None and image_labels is None:
+                outputs = self.showo.model(
+                    inputs_embeds=input_embeds,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                logits, last_hidden_states = None, outputs.last_hidden_state
+            else:
+                outputs = self.showo(
+                    inputs_embeds=input_embeds,
+                    attention_mask=attention_mask,
+                    # position_ids=position_ids,
+                    output_hidden_states=output_hidden_states
+                )
+                logits, last_hidden_states = outputs['logits'], outputs['hidden_states'][-1]
 
             # diffusion head to predict vector fields
             if hasattr(self, 'diff_proj'):
@@ -475,10 +488,13 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
 
                         v_pred_ = torch.cat([v_pred_cond, v_pred_uncond], dim=0)
                     else:
-                        v_pred_ = torch.cat([
-                            torch.zeros_like(v_pred_)[:-1, :, :],
-                            v_pred_[-1:, :, :]
-                        ], dim=0)
+                        if pairwise_conditioning:
+                            v_pred_ = keep_pair_targets_only(v_pred_)
+                        else:
+                            v_pred_ = torch.cat([
+                                torch.zeros_like(v_pred_)[:-1, :, :],
+                                v_pred_[-1:, :, :]
+                            ], dim=0)
 
                 return logits, v_pred_
 
@@ -492,8 +508,10 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
             modality_positions=None,
             first_frame_as_cond=False,
             only_denoise_last_image=False,
+            pairwise_conditioning=False,
             max_seq_len=None,
             guidance_scale=0.0,
+            generation_backbone_only=False,
             **kwargs,
     ):
         if guidance_scale > 0.0:
@@ -509,7 +527,9 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
                         modality_positions=modality_positions,
                         first_frame_as_cond=first_frame_as_cond,
                         only_denoise_last_image=only_denoise_last_image,
+                        pairwise_conditioning=pairwise_conditioning,
                         guidance_scale=guidance_scale,
+                        generation_backbone_only=generation_backbone_only,
                         output_hidden_states=True,
                         max_seq_len=max_seq_len)
             v_cond, v_uncond = torch.chunk(v, 2)
@@ -518,7 +538,10 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
 
         else:
             if t.shape[-1] != text_tokens.shape[0]:
-                t[:-1] = 1.0
+                if pairwise_conditioning:
+                    t = pair_timesteps_with_clean_condition(t, text_tokens.shape[0])
+                else:
+                    t[:-1] = 1.0
             _, v = self(text_tokens,
                         image_latents=image_latents,
                         t=t,
@@ -526,7 +549,9 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
                         modality_positions=modality_positions,
                         first_frame_as_cond=first_frame_as_cond,
                         only_denoise_last_image=only_denoise_last_image,
+                        pairwise_conditioning=pairwise_conditioning,
                         guidance_scale=guidance_scale,
+                        generation_backbone_only=generation_backbone_only,
                         output_hidden_states=True,
                         max_seq_len=max_seq_len)
             return v

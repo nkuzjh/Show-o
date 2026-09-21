@@ -26,16 +26,29 @@ if str(SHOWO_DIR) not in sys.path:
 
 from csgo_seen10 import data as dataset_module  # noqa: E402
 from csgo_seen10.data import CSGOSeen10Dataset, MAPS  # noqa: E402
+from csgo_seen10.acceleration import (  # noqa: E402
+    interleave_pairs,
+    keep_pair_targets_only,
+    pair_timesteps_with_clean_condition,
+)
 from csgo_seen10.model import RadarPoseFiLM  # noqa: E402
 from csgo_seen10.runtime import (  # noqa: E402
     IMAGE_TOKEN_COUNT,
+    Seen10InferenceConditionCache,
     build_flow_pair,
     build_interleaved_inputs,
+    explicit_euler_final,
+    generate_batch,
     is_valid_output,
+    noise_for_generators,
     save_rgb_jpeg,
     seed_validation_rng,
 )
-from infer_seen10 import INFERENCE_RNG_STRATEGY, _sample_seed  # noqa: E402
+from infer_seen10 import (  # noqa: E402
+    INFERENCE_RNG_STRATEGY,
+    _sample_seed,
+    iter_manifest_batches,
+)
 
 
 def test_released_27_by_27_position_table_interpolates_to_28_by_28() -> None:
@@ -129,6 +142,198 @@ def test_inference_rng_schedule_uses_zero_based_manifest_index() -> None:
     assert "zero-based dataset row order" in INFERENCE_RNG_STRATEGY
     with pytest.raises(ValueError, match="non-negative"):
         _sample_seed(42, -1)
+
+
+def test_inference_pair_helpers_preserve_each_sample_target() -> None:
+    radar = torch.tensor([[1.0], [2.0]])
+    target = torch.tensor([[10.0], [20.0]])
+    assert torch.equal(interleave_pairs(radar, target).flatten(), torch.tensor([1.0, 10.0, 2.0, 20.0]))
+
+    times = pair_timesteps_with_clean_condition(torch.tensor([0.25, 0.75]), batch_size=2)
+    assert torch.equal(times, torch.tensor([1.0, 0.25, 1.0, 0.75]))
+    already_paired = pair_timesteps_with_clean_condition(torch.tensor([0.5, 0.2, 0.6, 0.4]), batch_size=2)
+    assert torch.equal(already_paired, torch.tensor([1.0, 0.2, 1.0, 0.4]))
+
+    velocities = torch.tensor([[100.0], [1.0], [200.0], [2.0]])
+    assert torch.equal(keep_pair_targets_only(velocities).flatten(), torch.tensor([0.0, 1.0, 0.0, 2.0]))
+
+
+def test_batched_noise_matches_independent_manifest_seed_draws() -> None:
+    latent_batch = torch.zeros((3, 2, 2, 2))
+    seeds = [42, 43, 99]
+    generators = [torch.Generator(device="cpu").manual_seed(seed) for seed in seeds]
+    observed = noise_for_generators(latent_batch, generators)
+    expected = torch.cat(
+        [
+            torch.randn(
+                (1, *latent_batch.shape[1:]),
+                generator=torch.Generator(device="cpu").manual_seed(seed),
+            )
+            for seed in seeds
+        ],
+        dim=0,
+    )
+    assert torch.equal(observed, expected)
+
+
+def test_manifest_batches_are_stable_and_never_cross_map_boundaries() -> None:
+    dataset = SimpleNamespace(
+        rows=[
+            {"map_name": "a"},
+            {"map_name": "a"},
+            {"map_name": "a"},
+            {"map_name": "a"},
+            {"map_name": "a"},
+            {"map_name": "b"},
+            {"map_name": "b"},
+            {"map_name": "b"},
+        ]
+    )
+    assert list(iter_manifest_batches(dataset, 2)) == [[0, 1], [2, 3], [4], [5, 6], [7]]
+    with pytest.raises(ValueError, match="positive"):
+        list(iter_manifest_batches(dataset, 0))
+
+
+def test_condition_cache_reuses_radar_and_prompt_but_keeps_pose_per_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"radar": 0, "tokenizer": 0, "vae": 0, "mask": 0}
+    fake_models = types.ModuleType("models")
+
+    def fake_attn_mask(batch_size, sequence_length, modality_positions, device):
+        calls["mask"] += 1
+        return torch.zeros((batch_size, 1, sequence_length, sequence_length), device=device)
+
+    fake_models.omni_attn_mask_naive = fake_attn_mask
+    monkeypatch.setitem(sys.modules, "models", fake_models)
+
+    class TinyTokenizer:
+        def __call__(self, text: str, *, add_special_tokens: bool = False):
+            calls["tokenizer"] += 1
+            assert add_special_tokens is False
+            return SimpleNamespace(input_ids=[30, 31])
+
+    class CountingVAE:
+        def sample(self, images: torch.Tensor, *, deterministic: bool) -> torch.Tensor:
+            del deterministic
+            calls["vae"] += 1
+            values = images[:, :1, :1, :1, :1]
+            return values.expand(images.shape[0], 16, 1, 2, 2).contiguous()
+
+    class TinyDataset:
+        rows = [
+            {"map_name": "cs_agency", "map_id": 0, "pose": torch.tensor([0., 0., 0., 0., 0.])},
+            {"map_name": "cs_agency", "map_id": 0, "pose": torch.tensor([1., 2., 3., 4., 5.])},
+        ]
+
+        def get_condition_only(self, index: int):
+            calls["radar"] += 1
+            return {"radar": torch.full((3, 4, 4), 10.0 + index)}
+
+    cache = Seen10InferenceConditionCache(
+        vae=CountingVAE(),
+        tokenizer=TinyTokenizer(),
+        token_ids={"bos_id": 1, "boi_id": 2, "img_pad_id": 3, "eoi_id": 4, "eos_id": 5, "pad_id": 0},
+        device=torch.device("cpu"),
+        weight_dtype=torch.float32,
+        max_seq_length=1664,
+        max_prompt_tokens=64,
+    )
+    dataset = TinyDataset()
+    first_latents, first_inputs = cache.prepare_batch(dataset, [0, 1])
+    repeated_latents, repeated_inputs = cache.prepare_batch(dataset, [1])
+
+    assert first_latents.shape == (2, 16, 2, 2)
+    assert torch.equal(first_latents[0], first_latents[1])
+    assert torch.equal(repeated_latents[0], first_latents[0])
+    assert torch.equal(first_inputs["radar_pose"], torch.stack([row["pose"] for row in dataset.rows]))
+    assert not torch.equal(first_inputs["radar_pose"][0], first_inputs["radar_pose"][1])
+    assert first_inputs["text_tokens"].shape[0] == 2
+    assert repeated_inputs["text_tokens"].shape[0] == 1
+    assert calls == {"radar": 1, "tokenizer": 1, "vae": 1, "mask": 1}
+
+
+def test_explicit_euler_final_matches_torchdiffeq_fixed_euler() -> None:
+    from transport import Sampler, create_transport
+
+    transport = create_transport(path_type="Linear", prediction="velocity", do_shift=False, seq_len=785)
+    sampler = Sampler(transport)
+
+    def denoiser(x: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        time = t.reshape(t.shape[0], *([1] * (x.ndim - 1)))
+        return 0.25 * torch.tanh(x) + 0.1 * time
+
+    initial = torch.linspace(-1.0, 1.0, 2 * 3 * 2 * 2).reshape(2, 3, 2, 2)
+    settings = {"num_steps": 7, "time_shifting_factor": 3.0}
+    reference_sampler = sampler.sample_ode(
+        sampling_method="euler",
+        num_steps=settings["num_steps"],
+        reverse=False,
+        time_shifting_factor=settings["time_shifting_factor"],
+    )
+    reference = reference_sampler(initial, denoiser)[-1]
+    actual = explicit_euler_final(
+        initial,
+        denoiser,
+        sampler,
+        num_steps=settings["num_steps"],
+        time_shifting_factor=settings["time_shifting_factor"],
+        model_kwargs={},
+    )
+    assert torch.equal(actual, reference)
+
+
+def test_generate_batch_decodes_all_targets_in_one_vae_call() -> None:
+    from transport import Sampler, create_transport
+
+    class TinyGenerationModel:
+        def eval(self):
+            return self
+
+        def t2i_generate(self, image_latents, t, **kwargs):
+            del t, kwargs
+            return torch.zeros_like(image_latents)
+
+    class CountingDecodeVAE:
+        def __init__(self):
+            self.batch_sizes: list[int] = []
+
+        def batch_decode(self, latents: torch.Tensor) -> torch.Tensor:
+            self.batch_sizes.append(latents.shape[0])
+            return latents[:, :3]
+
+    transport = create_transport(path_type="Linear", prediction="velocity", do_shift=False, seq_len=785)
+    sampler = Sampler(transport)
+    vae = CountingDecodeVAE()
+    images = generate_batch(
+        TinyGenerationModel(),
+        vae,
+        sampler,
+        {"map_name": ["cs_agency", "cs_agency"]},
+        tokenizer=None,
+        token_ids={},
+        device=torch.device("cpu"),
+        weight_dtype=torch.float32,
+        max_seq_length=8,
+        max_prompt_tokens=64,
+        num_inference_steps=4,
+        sampling_method="euler",
+        atol=1e-6,
+        rtol=1e-3,
+        time_shifting_factor=3.0,
+        guidance_scale=0.0,
+        generators=[
+            torch.Generator(device="cpu").manual_seed(10),
+            torch.Generator(device="cpu").manual_seed(11),
+        ],
+        radar_latents=torch.zeros((2, 16, 2, 2)),
+        model_inputs={"text_tokens": torch.zeros((2, 8), dtype=torch.long)},
+    )
+
+    assert len(images) == 2
+    assert all(image.size == (2, 2) for image in images)
+    assert vae.batch_sizes == [2]
 
 
 def test_validation_rng_is_stable_after_dataloader_startup_consumes_cpu_rng(
