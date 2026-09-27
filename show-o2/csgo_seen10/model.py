@@ -108,6 +108,46 @@ class CSGOSeen10Model(nn.Module):
         return self.backbone.t2i_generate(image_latents=image_latents, t=t, **kwargs)
 
 
+class AlignedCSGOSeen10Model(nn.Module):
+    """Text-conditioned Seen-10 wrapper with no numeric radar adapter."""
+
+    conditioning_mode = "text"
+
+    def __init__(self, backbone: nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self._keep_frozen_vision_eval()
+
+    def _keep_frozen_vision_eval(self) -> None:
+        from .finetuning import LEGACY_POLICY
+
+        # Only v1 has a frozen vision path. Final-policy SigLIP/Conv adapters
+        # must follow train()/eval() so their LoRA dropout is active in training.
+        if getattr(self.backbone, "aligned_finetuning_policy", LEGACY_POLICY) != LEGACY_POLICY:
+            return
+        for name in ("image_embedder_und", "position_embedding", "und_trans"):
+            getattr(self.backbone, name).eval()
+
+    def train(self, mode: bool = True) -> "AlignedCSGOSeen10Model":
+        super().train(mode)
+        self._keep_frozen_vision_eval()
+        return self
+
+    def forward(self, *, image_latents: torch.Tensor, **kwargs: Any) -> Tuple[torch.Tensor, ...]:
+        kwargs.pop("radar_pose", None)
+        kwargs.pop("map_ids", None)
+        if kwargs.get("text_labels") is None:
+            kwargs["generation_backbone_only"] = True
+        return self.backbone(image_latents=image_latents, **kwargs)
+
+    @torch.no_grad()
+    def t2i_generate(self, image_latents: torch.Tensor, t: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("radar_pose", None)
+        kwargs.pop("map_ids", None)
+        kwargs["generation_backbone_only"] = True
+        return self.backbone.t2i_generate(image_latents=image_latents, t=t, **kwargs)
+
+
 def _resolve_local(path: str, project_showo_dir: str) -> str:
     from pathlib import Path
 
@@ -123,12 +163,13 @@ def load_showo2_seen10(
     device: torch.device,
     weight_dtype: torch.dtype,
     showo_dir: str,
-) -> Tuple[CSGOSeen10Model, Any, Dict[str, int], Dict[str, Any]]:
-    """Load the official 1.5B weights with 448px latent-position interpolation."""
+) -> Tuple[nn.Module, Any, Dict[str, int], Dict[str, Any]]:
+    """Load the official 1.5B weights with the selected Seen-10 policy."""
     from models import Showo2Qwen2_5
     from models.misc import get_text_tokenizer
 
     showo_config = config.model.showo
+    aligned = str(config.get("experiment", "")) == "csgo_seen10_exp32gen_aligned"
     showo_path = _resolve_local(showo_config.pretrained_model_path, showo_dir)
     qwen_path = _resolve_local(showo_config.llm_model_path, showo_dir)
     siglip_path = _resolve_local(config.model.clip.config_path, showo_dir)
@@ -145,16 +186,15 @@ def load_showo2_seen10(
         raise ValueError("Show-o2 tokenizer did not define the required [PAD] token")
     showo_token_ids["pad_id"] = int(text_tokenizer.pad_token_id)
 
-    # A 448px image encodes to a 56x56 Wan latent, then Show-o2 patchifies it
-    # into 28x28 = 784 spatial tokens. The released checkpoint's 27x27 position
-    # table is interpolated by the native Show-o2 forward path.
+    # Patch-grid dimensions follow the active profile's config. A 432px image
+    # uses the released checkpoint's native 27x27 position table.
     backbone, loading_info = Showo2Qwen2_5.from_pretrained(
         showo_path,
         llm_model_path=qwen_path,
         llm_vocab_size=len(text_tokenizer),
         load_from_showo=True,
-        image_latent_height=28,
-        image_latent_width=28,
+        image_latent_height=int(showo_config.get("image_latent_height", 27 if aligned else 28)),
+        image_latent_width=int(showo_config.get("image_latent_width", 27 if aligned else 28)),
         clip_pretrained_model_path=siglip_path,
         torch_dtype=weight_dtype,
         use_safetensors=False,
@@ -165,6 +205,19 @@ def load_showo2_seen10(
     if missing_keys:
         raise RuntimeError(f"Official Show-o2 checkpoint did not initialize all model parameters: {missing_keys}")
     backbone = backbone.to(device)
+
+    if aligned:
+        from .finetuning import (
+            assert_aligned_parameter_counts,
+            configure_aligned_finetuning,
+            policy_from_config,
+            trainable_parameter_audit,
+        )
+
+        configure_aligned_finetuning(backbone, policy=policy_from_config(config))
+        model = AlignedCSGOSeen10Model(backbone).to(device)
+        assert_aligned_parameter_counts(trainable_parameter_audit(model))
+        return model, text_tokenizer, showo_token_ids, loading_info
 
     # Follow the project's downstream freeze policy: preserve the language and
     # semantic understanding towers while adapting the generation path.

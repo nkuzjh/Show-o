@@ -16,6 +16,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 from transformers import AutoConfig, SiglipConfig
 from torch.nn.attention.flex_attention import BlockMask
@@ -391,7 +392,8 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
                             new_image_labels[i, offset:offset + length] = image_labels[
                                                                           i * modality_positions.size(1) + j, :length]
 
-            if generation_backbone_only and text_labels is None and image_labels is None:
+            if (generation_backbone_only and text_labels is None
+                    and (image_labels is None or getattr(self, "aligned_flow_only", False))):
                 outputs = self.showo.model(
                     inputs_embeds=input_embeds,
                     attention_mask=attention_mask,
@@ -415,12 +417,28 @@ class Showo2Qwen2_5(ModelMixin, ConfigMixin):
                 last_hidden_states = self.diff_proj(last_hidden_states)
             position_ids = torch.arange(last_hidden_states.shape[1], device=last_hidden_states.device).unsqueeze(0)
             for layer in self.diffusion_head_a:
-                last_hidden_states = layer(hidden_states=last_hidden_states,
-                                           adaln_input=time_embeds,
-                                           attention_mask=attention_mask,
-                                           position_ids=position_ids,
-                                           modality_positions=modality_positions,
-                                           )[0]
+                if getattr(self, "diffusion_gradient_checkpointing", False) and self.training and torch.is_grad_enabled():
+                    # Non-reentrant checkpointing supports trainable LoRA and
+                    # affine weights even when some inputs are frozen.
+                    last_hidden_states = checkpoint(
+                        lambda states, times, block=layer: block(
+                            hidden_states=states,
+                            adaln_input=times,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            modality_positions=modality_positions,
+                        )[0],
+                        last_hidden_states,
+                        time_embeds,
+                        use_reentrant=False,
+                    )
+                else:
+                    last_hidden_states = layer(hidden_states=last_hidden_states,
+                                               adaln_input=time_embeds,
+                                               attention_mask=attention_mask,
+                                               position_ids=position_ids,
+                                               modality_positions=modality_positions,
+                                               )[0]
             v_pred = self.diffusion_head_b(last_hidden_states, time_embeds, modality_positions)
 
             # [:v_pred.shape[0]] is the valid image labels (special case for interleaved data training)

@@ -41,6 +41,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--resume", nargs="?", const="latest", default=None)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--micro-batch", type=int, default=None)
+    parser.add_argument("--gradient-accumulation", type=int, default=None)
     return parser.parse_args()
 
 
@@ -234,6 +236,13 @@ def main() -> None:
     if not config_path.is_absolute():
         config_path = script_dir / config_path
     config = OmegaConf.load(config_path)
+    if str(config.get("experiment", "")) == "csgo_seen10_exp32gen_aligned":
+        from csgo_seen10.aligned_training import main as aligned_main
+
+        aligned_main(args, config, script_dir)
+        return
+    if args.micro_batch is not None or args.gradient_accumulation is not None:
+        raise ValueError("--micro-batch and --gradient-accumulation require the aligned experiment profile")
     if args.seed is not None:
         config.training.seed = args.seed
     seed = int(config.training.seed)

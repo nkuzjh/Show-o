@@ -1,3 +1,5 @@
+> 本文件以下内容是首次 numeric-FiLM 接入的历史需求，不是当前执行指令，不覆盖后续批准的 aligned_v2_final 方案。当前环境、命令与状态统一见 [CSGO_SEEN10.md](CSGO_SEEN10.md)；最终 LoRA/full/frozen 配置、两张数据流图与横向对比见 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)；分版本验收证据见 [CSGO_ALIGNED_VALIDATION.md](CSGO_ALIGNED_VALIDATION.md)。原 [CSGO_ALIGNED.md](CSGO_ALIGNED.md) 保留导航兼容。正式训练、全量推理和评测由用户手动执行。
+
 你负责将当前已 clone 的独立模型项目接入 CSGO Benchmark v2 Seen-10。
 
 【项目参数】

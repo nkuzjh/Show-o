@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -20,6 +22,10 @@ from csgo_seen10.runtime import (
     resolve_project_path,
     save_rgb_jpeg,
     write_inference_manifest,
+    dataset_kwargs,
+    is_aligned,
+    sample_identity_seed,
+    sha256_paths,
 )
 
 
@@ -37,6 +43,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--inference-seed", type=int, default=None)
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--output-root", default=None, help="Seed output root; contains discrete/ and continuous/")
+    parser.add_argument("--prediction-output-root", default=None, help="Aligned-only isolated prediction root")
     parser.add_argument(
         "--checkpoint", default="best", help="Checkpoint directory or best/late/latest alias"
     )
@@ -70,7 +77,7 @@ def _configured_batch_size(config: Any) -> int:
 def _inference_settings(config: Any, batch_size: Optional[int] = None) -> Dict[str, Any]:
     if batch_size is None:
         batch_size = _configured_batch_size(config)
-    return {
+    settings = {
         "resolution": int(config.dataset.resolution),
         "max_seq_length": int(config.dataset.max_seq_length),
         "max_prompt_tokens": int(config.dataset.max_prompt_tokens),
@@ -90,6 +97,30 @@ def _inference_settings(config: Any, batch_size: Optional[int] = None) -> Dict[s
         "condition_cache": "one preprocessed radar latent and sequence template per map; pose per sample",
         "rng_strategy": INFERENCE_RNG_STRATEGY,
     }
+    if is_aligned(config):
+        settings.pop("batch_size")  # Execution batching does not define a different experiment.
+        settings.update(generation_algorithm="showo2_aligned_native_v1", condition_cache="radar latent per map; text pose per sample",
+                        rng_strategy="sha256(showo2-aligned-v1, seed, sample_id) low63; per-sample generator",
+                        nfe=int(config.transport.num_inference_steps) - 1,
+                        precision=str(config.training.mixed_precision), output_resolution=448,
+                        vae="Wan2.1", resize_mode=str(config.dataset.resize_mode))
+    return settings
+
+
+def bind_prediction_checkpoint(output_root: Path, checkpoint_dir: Path) -> None:
+    """Bind both task directories to one immutable checkpoint before any generation."""
+    files = [checkpoint_dir / "backbone_trainable.safetensors", checkpoint_dir / "finetuning.json"]
+    record = {"path": str(checkpoint_dir), "sha256": sha256_paths(files)}
+    output_root.mkdir(parents=True, exist_ok=True)
+    path = output_root / "checkpoint_binding.json"
+    if path.exists():
+        if json.loads(path.read_text()) != record:
+            raise ValueError("Prediction root is bound to a different checkpoint; use a fresh root")
+    else:
+        if any(output_root.glob("*/gen_imgs/*/*.jpg")):
+            raise ValueError("Unattributed prediction files already exist; use a fresh root")
+        with path.open("x") as stream:
+            json.dump(record, stream, indent=2)
 
 
 def _sample_seed(inference_seed: int, manifest_index: int) -> int:
@@ -146,7 +177,7 @@ def _run_task(
         data_root,
         split,
         include_target=False,
-        resolution=int(config.dataset.resolution),
+        **dataset_kwargs(config),
         limit=limit,
     )
     task_root = output_root / task
@@ -167,6 +198,15 @@ def _run_task(
         generation_complete=False,
     )
     model.eval()
+    if is_aligned(config):
+        identities = [{key: row.get(key) for key in ("sample_id", "map_name", "file_frame", "clip_id", "frame_index")} for row in dataset.rows]
+        identity_path = task_root / "sample_manifest.json"
+        if identity_path.exists() and json.loads(identity_path.read_text()) != identities:
+            raise ValueError("Existing sample manifest does not match requested split")
+        temporary = identity_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(identities, indent=2) + "\n")
+        os.replace(temporary, identity_path)
+        print(f"Aligned inference: batch_size={batch_size}, target=False, rows={len(dataset)}, seed={inference_seed}", flush=True)
 
     generated = 0
     preserved = 0
@@ -182,7 +222,9 @@ def _run_task(
         if any(missing):
             radar_latents, model_inputs = condition_cache.prepare_batch(dataset, indices)
             generators = [
-                torch.Generator(device=str(device)).manual_seed(_sample_seed(inference_seed, index))
+                torch.Generator(device=str(device)).manual_seed(
+                    sample_identity_seed(inference_seed, str(dataset.rows[index]["sample_id"]))
+                    if is_aligned(config) else _sample_seed(inference_seed, index))
                 for index in indices
             ]
             images = generate_batch(
@@ -205,6 +247,7 @@ def _run_task(
                 generators=generators,
                 radar_latents=radar_latents,
                 model_inputs=model_inputs,
+                **({"vae_batch_size": int(config.inference.get("vae_batch_size", 1))} if is_aligned(config) else {}),
             )
             for image, destination, needs_generation in zip(images, destinations, missing):
                 if needs_generation:
@@ -270,6 +313,12 @@ def main() -> None:
         output_root = project_root / output_root
     output_root = output_root.resolve()
     checkpoint_dir = _checkpoint_path(args.checkpoint, output_root)
+    if is_aligned(config):
+        label = args.checkpoint if args.checkpoint in {"best", "late", "latest"} else checkpoint_dir.name
+        output_root = Path(args.prediction_output_root).resolve() if args.prediction_output_root else output_root / "predictions" / label
+        bind_prediction_checkpoint(output_root, checkpoint_dir)
+    elif args.prediction_output_root:
+        raise ValueError("--prediction-output-root is only supported by the aligned profile")
     data_root = str(args.data_root or config.benchmark.data_root)
 
     model, vae, tokenizer, token_ids, device, weight_dtype, vae_path, loading_info = load_runtime(

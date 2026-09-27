@@ -1,0 +1,83 @@
+# Final native Show-o2 image-conditioned generation policy.
+experiment: csgo_seen10_exp32gen_aligned
+benchmark:
+  id: csgo_benchmark_v2
+  data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+output_root: outputs/csgo_benchmark_v2_aligned/csgo_seen10_exp32gen_aligned_v2_final
+model:
+  vae_model:
+    type: wan21
+    pretrained_model_path: checkpoints/Wan2.1_VAE.pth
+  showo:
+    model_name: Showo2
+    load_from_showo: true
+    pretrained_model_path: checkpoints/show-o2-1.5B
+    llm_model_path: checkpoints/Qwen2.5-1.5B-Instruct
+    image_latent_dim: 16
+    image_latent_height: 27
+    image_latent_width: 27
+    patch_size: 2
+    add_time_embeds: true
+  clip:
+    config_path: checkpoints/siglip-so400m-patch14-384
+finetuning:
+  policy: aligned_v2_final
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  lora_bias: false
+  expected_trainable_parameters: 336481088
+dataset:
+  resolution: 432
+  resize_mode: full
+  conditioning_mode: text
+  max_seq_length: 2048
+  max_prompt_tokens: 256
+  num_workers: 6
+  pin_memory: true
+  persistent_workers: true
+optimizer:
+  learning_rate: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.0
+  epsilon: 1.0e-8
+lr_scheduler:
+  name: cosine_with_min_lr
+  warmup_ratio: 0.003
+  warmup_steps: 59
+  min_lr: 0.00001
+training:
+  seed: 42
+  deterministic_algorithms: true
+  mixed_precision: bf16
+  enable_tf32: true
+  max_optimizer_steps: 19500
+  batch_size: 8
+  gradient_accumulation_steps: 16
+  effective_generation_batch: 128
+  max_grad_norm: 1.0
+  checkpoint_steps: [4000, 8000, 12000, 16000, 19500]
+  log_every: 1
+  smoke_validation_samples: 2
+  cond_dropout_prob: 0.0
+transport:
+  path_type: Linear
+  prediction: velocity
+  loss_weight: null
+  train_eps: null
+  sample_eps: null
+  snr_type: lognorm
+  do_shift: true
+  sampling_method: euler
+  num_inference_steps: 50
+  atol: 1.0e-6
+  rtol: 1.0e-3
+  time_shifting_factor: 3.0
+  guidance_scale: 0.0
+inference:
+  seed: 42
+  batch_size: 16
+  vae_batch_size: 1
+  max_samples: null

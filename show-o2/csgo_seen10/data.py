@@ -62,14 +62,19 @@ def _safe_under(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _load_rgb_tensor(path: Path, resolution: int) -> torch.Tensor:
+def _load_rgb_tensor(path: Path, resolution: int, resize_mode: str = "center_crop") -> torch.Tensor:
     """Match Show-o2's resize-short-side, center-crop, RGB and [-1, 1] transform."""
     with Image.open(path) as opened:
         image = opened.convert("RGB")
     width, height = image.size
     if min(width, height) <= 0:
         raise ValueError(f"Invalid image size at {path}: {image.size}")
-    if width <= height:
+    if resize_mode == "full":
+        # Keep the entire FPV field of view, as the shared evaluator does.
+        resized = (resolution, resolution)
+    elif resize_mode != "center_crop":
+        raise ValueError(f"Unknown resize mode: {resize_mode}")
+    elif width <= height:
         resized = (resolution, int(resolution * height / width))
     else:
         resized = (int(resolution * width / height), resolution)
@@ -82,6 +87,18 @@ def _load_rgb_tensor(path: Path, resolution: int) -> torch.Tensor:
     return tensor
 
 
+def pose_instruction(row: Dict[str, Any], z_min: float, z_max: float) -> str:
+    """Use the physical-value prompt/precision of UniLIP exp32_gen."""
+    return (
+        f"Generate a CS2 FPV image on map '{row['map']}' from the radar map and camera pose: "
+        f"x={float(row['x']):.1f}, y={float(row['y']):.1f}, z={float(row['z']):.3f}, "
+        f"pitch={math.degrees(float(row['angle_v'])):.1f}, "
+        f"yaw={math.degrees(float(row['angle_h'])):.1f}. "
+        "Coordinates use 1024x1024 map pixels; angles are degrees; yaw 0=east clockwise; "
+        f"pitch 0=down, 180=up; z range [{z_min:.2f}, {z_max:.2f}]."
+    )
+
+
 class CSGOSeen10Dataset(Dataset):
     """Read one official Seen-10 split without scanning the image tree."""
 
@@ -92,6 +109,8 @@ class CSGOSeen10Dataset(Dataset):
         *,
         include_target: bool,
         resolution: int = 448,
+        resize_mode: str = "center_crop",
+        conditioning_mode: str = "numeric",
         limit: Optional[int] = None,
         limit_per_map: Optional[int] = None,
     ) -> None:
@@ -104,6 +123,12 @@ class CSGOSeen10Dataset(Dataset):
         self.split = split
         self.include_target = include_target
         self.resolution = int(resolution)
+        if resize_mode not in {"center_crop", "full"}:
+            raise ValueError(f"Unknown resize mode: {resize_mode}")
+        if conditioning_mode not in {"numeric", "text"}:
+            raise ValueError(f"Unknown conditioning mode: {conditioning_mode}")
+        self.resize_mode = resize_mode
+        self.conditioning_mode = conditioning_mode
         if self.resolution <= 0:
             raise ValueError("resolution must be positive")
 
@@ -194,6 +219,12 @@ class CSGOSeen10Dataset(Dataset):
                 self.data_root / self.manifest.get("selected_images", {}).get("file", "selected_images.sha256")
             ),
         }
+        if self.conditioning_mode == "text":
+            self.provenance["z_calibration_sha256"] = sha256_file(calibration_path)
+            self.provenance["split_files_sha256"] = {
+                map_name: sha256_file(self.data_root / "splits" / "seen" / map_name / SPLIT_FILES[split])
+                for map_name in MAPS
+            }
 
     def _rows_for_map(self, payload: Any, map_name: str) -> List[Dict[str, Any]]:
         if self.split == "continuous":
@@ -254,7 +285,7 @@ class CSGOSeen10Dataset(Dataset):
             target_path = _safe_under(self.data_root, image_relative)
         else:
             target_path = None
-        return {
+        result = {
             "sample_id": f"{map_name}/{file_frame}",
             "map_name": map_name,
             "map_id": self.map_to_id[map_name],
@@ -265,6 +296,12 @@ class CSGOSeen10Dataset(Dataset):
             "radar_path": radar_path,
             "target_path": target_path,
         }
+        if self.conditioning_mode == "text":
+            result["instruction"] = pose_instruction({**row, "map": map_name}, z_min, z_max)
+            result["pose_physical"] = [
+                float(row[name]) for name in ("x", "y", "z", "angle_v", "angle_h")
+            ]
+        return result
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -272,8 +309,8 @@ class CSGOSeen10Dataset(Dataset):
     def get_condition_only(self, index: int) -> Dict[str, Any]:
         """Load only radar and metadata, even when this is a train/val dataset."""
         row = self.rows[index]
-        return {
-            "radar": _load_rgb_tensor(row["radar_path"], self.resolution),
+        sample = {
+            "radar": _load_rgb_tensor(row["radar_path"], self.resolution, self.resize_mode),
             "pose": row["pose"],
             "map_id": torch.tensor(row["map_id"], dtype=torch.long),
             "sample_id": row["sample_id"],
@@ -282,6 +319,10 @@ class CSGOSeen10Dataset(Dataset):
             "clip_id": row["clip_id"] or "",
             "frame_index": -1 if row["frame_index"] is None else row["frame_index"],
         }
+        if self.conditioning_mode == "text":
+            sample["instruction"] = row["instruction"]
+            sample["image_token_count"] = (self.resolution // 16) ** 2 + 1
+        return sample
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         row = self.rows[index]
@@ -290,7 +331,7 @@ class CSGOSeen10Dataset(Dataset):
             target_path = row["target_path"]
             if target_path is None:
                 raise RuntimeError("Target path missing in target-enabled dataset")
-            sample["target"] = _load_rgb_tensor(target_path, self.resolution)
+            sample["target"] = _load_rgb_tensor(target_path, self.resolution, self.resize_mode)
         return sample
 
 
