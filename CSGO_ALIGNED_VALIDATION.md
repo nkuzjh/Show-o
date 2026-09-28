@@ -11,14 +11,9 @@
 - 调整前v1真实权重CPU审计仍为79,445,056可训练参数：[v1审计](outputs/aligned_v1_compat_cpu_audit_20260927/parameter_audit.json)。按正常加载流程解析LLM绝对路径后，其semantic config digest与历史v1 checkpoint一致。历史audit缺少新增policy/空alias字段可兼容，但真实共享关系、存储量或参数变化仍严格拒绝；CPU与GPU的存储关系可能不同，不能据此承诺跨设备bitwise恢复。
 - `bash -n scripts/run_csgo_seen10.sh`、启动器两版本dry-run和 `git diff --check` 通过。
 
-复核真实权重审计（使用一个不存在的新目录，脚本仅使用CPU，不下载权重）：
+上述真实权重审计由 [参数审计脚本](scripts/audit_aligned_parameters.py) 执行，仅使用CPU；此处记录证据，不要求用户额外运行复核命令。
 
-```bash
-show-o2/.venv/bin/python scripts/audit_aligned_parameters.py \
-  --output-dir outputs/aligned_v2_cpu_audit_manual --backward-smoke
-```
-
-当次实现验收时GPU正被其他项目训练占用，未启动GPU smoke，也未启动正式训练、离散/连续全量推理或评测；未停止或修改其他项目任务。最终版432分辨率GPU显存/吞吐、真实模型GPU恢复，以及新的离散/连续生成与共享evaluator端到端smoke仍需用户手动执行主文档中的隔离smoke，并另外完成同布局2步恢复对照。下面的v1历史GPU结果不作为v2已完成这些检查的证据。
+当次实现验收时GPU正被其他项目训练占用，未启动GPU smoke，也未启动正式训练、离散/连续全量推理或评测；未停止或修改其他项目任务。最终版432分辨率GPU显存/吞吐、真实模型GPU恢复，以及新的离散/连续生成与共享evaluator端到端smoke仍未验收，主文档不再把它们列为日常手动操作步骤。下面的v1历史GPU结果不作为v2已完成这些检查的证据。
 
 ## 2. 历史 aligned_v1：2026-09-27（不能作为 v2 的验收）
 
@@ -29,13 +24,7 @@ show-o2/.venv/bin/python scripts/audit_aligned_parameters.py \
 
 每步128条源样本，累计256；scheduler更新2次，保存时accumulation边界为0。最终同布局恢复比较全部通过：568个可训练张量（79,445,056参数）、完整模型文件SHA256、optimizer、scheduler、全部rank RNG、训练状态、loss和源样本顺序均相同。step2 validation flow loss为0.3252403885126114（仅2条smoke验证样本）。结果和完整参数审计分别保存在resume目录的 `resume_verification.json`、`parameter_audit.json`。
 
-可只读复核（RNG/optimizer使用pickle，仅对本地可信checkpoint运行）：
-
-```bash
-show-o2/.venv/bin/python scripts/verify_aligned_resume.py \
-  outputs/aligned_smoke_20260927_deterministic_control/checkpoints/step_000002 \
-  outputs/aligned_smoke_20260927_deterministic_resume/checkpoints/step_000002
-```
+上述只读对照使用 [恢复验证脚本](scripts/verify_aligned_resume.py) 检查control/resume各自的step_000002；RNG/optimizer使用pickle，范围仅限本地可信checkpoint。这是历史验收记录，不是日常运行的额外步骤。
 
 回归测试37项通过，包括真实双进程CPU/DDP全局batch128梯度等价检查；`bash -n`及`git diff --check`通过。只有一张物理GPU，没有声称完成真实多GPU训练验收。
 
@@ -66,3 +55,24 @@ show-o2/.venv/bin/python scripts/verify_aligned_resume.py \
 真实GPU训练flow loss为`1.2272881269454956`，固定seed重复验证loss为`1.2011971473693848`。保存可恢复Accelerator状态、可训练backbone和Radar adapter，`late`/`latest`/`best`均指向`step_000001`。重新加载后生成离散/连续各一张，独立核验RGB、448×448 JPEG；两个manifest均为`generation_complete=true`、`smoke_only=true`并绑定同一checkpoint。
 
 共享evaluator成功读取两类输出，各为1/1覆盖，报告`formal=false`，不写正式指标产物。再次推理两任务均`generated=0`、`preserved_valid=1`；图片mtime、大小、SHA256不变。当次`RUN_FULL=0`，未执行或声称完成50,000步正式训练、20,000/12,800全量生成或Table 1结果；此后legacy实际完成的训练不倒写为当次smoke成果。
+
+## 4. 双服务器初始化：2026-09-28（不是新的模型验收）
+
+本地只读硬件/环境取证：RTX PRO 6000 Blackwell Server Edition、compute capability12.0、driver580.173.02、glibc2.39、Python3.13.11；当前项目venv继承宿主torch2.12.0+cu130、torchvision0.27.0+cu130。用户提供远程计算节点截图为4×A100 80GB、driver550.54.14、Python3.13.5。未访问远程机器执行命令。
+
+- 新增local/remote初始化入口与共享环境helper，分别固定2.12.0/cu130和2.6.0/cu124；旧setup默认local。Python固定3.13系列，补丁版本不强制相同。依赖与资源准备可分步，CPU检查和显式CUDA小检查分开。
+- 主代理执行 `tests/test_csgo_seen10_setup.py`（16项）和 `tests/test_csgo_aligned_launcher.py`（6项），**22项通过**。JUnit：[pytest.xml](outputs/setup_env_verification_20260928.AaoZBU/pytest.xml)。测试在临时目录中拦截venv/pip操作，没有真实安装包或下载权重。
+- 覆盖remote精确wheel/index/constraints选择、本地健康继承环境不调用pip、显式空venv备份修复（含Python3.13生成的`.gitignore`）、非空/异常环境拒绝、错误torch版本拒绝、requirements版本检查、缺独立packaging时使用pip内置解析器、路径含空格/非cwd、参数冲突、dry-run不初始化GPU等。
+- 实际旧入口 `bash scripts/setup_csgo_seen10.sh --check` 与local wrapper的只读CPU检查通过；`--check-cuda --dry-run`只打印计划，没有执行CUDA。三个shell的 `bash -n`、`git diff --check`及文档链接/代码块检查通过。
+- 比对45个模型/数据/训练/推理/配置/runner文件SHA256，全部与修改前一致。原依赖清单只修改说明注释，公共依赖有效条目不变；新增profile constraints固定torch/vision。官方资产revision/URL/大小/SHA及实际下载实现保持不变。
+
+未做：真实fresh安装、真实远程A100 CUDA/模型smoke、跨环境训练或恢复。未下载大依赖/模型、修改Conda base/系统驱动、覆盖现有venv或实验结果，也未启动或停止已有训练任务。本轮CPU/模拟结果不能替代各服务器实际安装后的GPU验收，不继承旧环境的bitwise恢复保证。操作命令统一见主文档第4节。
+
+## 5. 初始化入口精简：2026-09-28（后续调整）
+
+- 主文档提供local/remote各自的环境配置与权重下载分步命令，并单列无参“环境＋权重”合并命令；二选一，不要求额外检查或smoke。原有高级参数继续兼容，不关闭内置校验。
+- full/env-only模式默认对严格识别的缺torch、仅含初始化组件的失败继承venv先备份后重建，无需手动修复参数；含用户文件、错误版本、异常路径等情况仍拒绝覆盖。仅下载/只读模式不修复或修改环境，dry-run不写入。
+- 主代理运行真实pytest：初始化34项＋旧runner6项，**40项通过（3.26秒）**。安装/重建操作均在临时目录内mock；测试包括两台profile的自动恢复、显式旧参数兼容、备份保留、非空保护、只读/下载模式隔离、无参入口full分派和旧runner输出隔离。
+- 三个初始化Shell语法与help通过；三份当前文档共11个Bash代码块语法、14条runner命令只解析、本地链接以及主文档不包含手动检查/smoke命令的检查通过。补正文档中aligned默认checkpoint为late的旧描述，未改变runner或实验默认值。
+
+没有执行真实pip/venv安装、权重下载、GPU运算、训练、推理或评测；未修改已有环境、checkpoint、数据或结果。以上是入口/文档回归，不是远程服务器实机安装或模型验收。

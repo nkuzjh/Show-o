@@ -1,6 +1,6 @@
 # Show-o2 接入 CSGO Benchmark v2 Seen-10
 
-本文统一维护已经实现的运行行为、环境权重、手动命令、输出和带日期的状态快照。命令从 `/home/jiahao/task/Show-o` 执行；实际模型工作目录是嵌套的 `show-o2/`。仅涉及 **radar/map + 当前5DoF pose → FPV**，不增加定位或时序任务，不包含 CrossMap-4。
+本文统一维护已经实现的运行行为、环境权重、手动命令、输出和带日期的状态快照。命令从各服务器的Show-o仓库根执行（本地 `/home/jiahao/task/Show-o`，用户远程 `~/task/Show-o`）；实际模型工作目录是嵌套的 `show-o2/`。仅涉及 **radar/map + 当前5DoF pose → FPV**，不增加定位或时序任务，不包含 CrossMap-4。
 
 文档分工参考 ControlAR、OmniGen2，但模型、配置与验收结论只依据 Show-o2：
 
@@ -96,18 +96,90 @@ checkpoint在梯度累计边界0原子落盘，包含模型LoRA/full、optimizer
 
 legacy别名语义不同：`late`/`latest`每次保存更新，`best`按旧验证子集选取；其checkpoint不与aligned互通。外部模型best对UniLIP final不能声称严格同选点规则。
 
-## 4. 环境、官方权重与路径
+## 4. 本地 / 远程初始化、官方权重与路径
 
-现有准备命令会安装依赖并准备/下载资产，不是只读检查；仅在环境未准备好且用户需要时执行：
+按所在服务器选择第4.2或第4.3的分步流程（先环境、后权重），也可以直接选择第4.4的一键合并命令；两种流程任选其一，不需要重复执行。必要的版本、导入和权重完整性校验由脚本内部完成，不需要另行执行检查或验证命令。初始化不会启动训练、推理或评测。
+
+### 4.1 为什么采用两套环境
+
+2026-09-28核实的本地环境是 **RTX PRO 6000 Blackwell Server Edition（计算能力12.0）/ 驱动580.173.02 / Python3.13.11**；用户远程计算节点是 **4×A100 80GB / 驱动550.54.14 / Python3.13.5**。远程登录节点 `cluster-master` 没有 `nvidia-smi`，不能据此判定计算节点无GPU。
+
+| 配置 | 本地 local | 远程 remote |
+| --- | --- | --- |
+| Python实测版本 | 3.13.11 | 3.13.5 |
+| PyTorch | 2.12.0+cu130 | 2.6.0+cu124 |
+| torchvision | 0.27.0+cu130 | 0.21.0+cu124 |
+| GPU适用对象 | 本地Blackwell | 远程A100 |
+| 环境方式 | 兼容现有合格宿主继承venv；新建时优先复用匹配宿主，否则隔离安装 | 项目内隔离venv，不依赖或修改Conda base |
+| 初始化入口 | `scripts/setup_csgo_seen10_local.sh` | `scripts/setup_csgo_seen10_remote.sh` |
+
+本地现有cu130不能直接给550驱动使用；远程cu124也不作为本地Blackwell的受支持运行配置。PyTorch从2.7/cu128开始提供Blackwell支持，CUDA13.x通常要求580及以上驱动。这里采用两套配置保留已验证的本地环境，不升级任何驱动，也不尝试未经两机验证的折中组合；并非声称理论上不存在其他共同版本。[PyTorch Blackwell说明](https://pytorch.org/blog/pytorch-2-7/)、[NVIDIA兼容说明](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)。
+
+两套脚本共享其余模型依赖和同一套权重下载逻辑。本次初始化profile均要求Python3.13，补丁版本不固定，适用于上述3.13.11与3.13.5；其他Python版本不是本次部署目标。远程2.6.0/0.21.0有官方Python3.13 Linux x86_64安装包，无需仅为torch降级现有Python。[官方版本组合](https://pytorch.org/get-started/previous-versions/#v260)、[cu124安装包](https://download.pytorch.org/whl/cu124/torch/)。不同torch/CUDA环境不承诺跨机器逐位恢复；远程完整Show-o2链路仍需独立验收。
+
+核心公共依赖为transformers4.47.0、diffusers0.31.0、timm1.0.12、torchdiffeq0.2.5、peft0.18.1，完整清单见 [requirements-csgo-seen10.txt](show-o2/requirements-csgo-seen10.txt)。[local约束](show-o2/constraints-csgo-seen10-local.txt)和[remote约束](show-o2/constraints-csgo-seen10-remote.txt)固定各自torch/torchvision，防止安装其他依赖时切换CUDA组合。
+
+### 4.2 本地服务器：分步准备
+
+本地Blackwell服务器，先只配置环境：
 
 ```bash
 cd /home/jiahao/task/Show-o
-bash scripts/setup_csgo_seen10.sh
+bash scripts/setup_csgo_seen10_local.sh --env-only
 ```
 
-与参考项目不同，目前Show-o2没有 `--env-only`、独立下载脚本或 `--print-paths` 迁移接口，不应复制其他仓库的命令。脚本使用 `show-o2/.venv` 的 `--system-site-packages`，要求继承主机PyTorch2.12+cu130，不自动安装其他torch/CUDA版本。可用 `PYTHON_BIN` 选择创建venv的解释器，但仍须满足该前提。现有环境复用后仍会运行依赖安装，不是“保证原环境不变”。
+环境准备成功后，单独下载/校验权重：
 
-历史本机验收环境：Python3.13.11、PyTorch2.12.0+cu130、torchvision0.27.0、transformers4.47.0、diffusers0.31.0、timm1.0.12、torchdiffeq0.2.5；aligned增加peft0.18.1。完整依赖见 [requirements-csgo-seen10.txt](show-o2/requirements-csgo-seen10.txt)。这不是在另一台服务器完成过安装/GPU验收的承诺。
+```bash
+bash scripts/setup_csgo_seen10_local.sh --assets-only
+```
+
+复用已符合版本的本地环境；新建时优先继承匹配的宿主torch，否则在项目内隔离安装。脚本不修改系统Python、Conda base或驱动。
+
+### 4.3 远程服务器：分步准备
+
+先将此次脚本变更同步到远程仓库，再只配置环境；不要照抄原机器的 `/home/jiahao/...`：
+
+```bash
+cd ~/task/Show-o
+bash scripts/setup_csgo_seen10_remote.sh --env-only
+```
+
+环境准备成功后，单独下载/校验权重：
+
+```bash
+bash scripts/setup_csgo_seen10_remote.sh --assets-only
+```
+
+远程创建 `show-o2/.venv`，在其中安装固定的cu124 torch/torchvision及共用依赖；不会向Conda base安装torch，也不要求登录节点具有GPU。请不要将本地 `.venv` 复制到远程或反向复制。
+
+之前报错留下的空继承环境也使用上面的环境配置命令（或第4.4合并命令），无需修复参数：脚本只对经内部检查确认仅含pip/setuptools/wheel等初始化组件、没有torch的未完成环境，自动先备份再重建。备份保留为 `show-o2/.venv.incomplete-backup-<时间>-<PID>-<序号>`，实际路径会打印，不自动删除。存在用户包、已安装的错误torch版本、异常目录或符号链接时仍拒绝自动替换。已有checkpoint、下载缓存和实验输出不移动、不删除。
+
+两个初始化入口都使用本机仓库下的 `show-o2/.venv`，不是同一个目录内并存两套环境。不得在同一checkout里交替执行local/remote来切换已安装环境，更不能让正在运行的任务使用的环境被覆盖。
+
+### 4.4 可选：一键配置环境并下载权重
+
+不想分步时，使用以下对应服务器的合并命令，替代第4.2/4.3的两步，不需要再单独下载。
+
+本地服务器：
+
+```bash
+cd /home/jiahao/task/Show-o
+bash scripts/setup_csgo_seen10_local.sh
+```
+
+远程服务器：
+
+```bash
+cd ~/task/Show-o
+bash scripts/setup_csgo_seen10_remote.sh
+```
+
+两套入口的无参模式均为“环境＋权重”；`--env-only`只准备环境，`--assets-only`只下载/校验资产且要求环境已准备好，不安装依赖或修复环境。权重相同，下载逻辑共用，但命令仍需选择本机的local/remote入口以匹配环境。
+
+### 4.5 官方权重与运行路径
+
+分步下载和一键合并准备的资产完全相同。已满足的依赖和校验通过的大权重复用；下载中断后可重跑对应下载命令或合并命令。
 
 | 本地资产（均位于 `show-o2/checkpoints/`） | 来源/固定方式 |
 | --- | --- |
@@ -129,16 +201,24 @@ bash scripts/setup_csgo_seen10.sh
 | 旧配置覆盖 | `CONFIG`用于legacy；显式aligned选择其canonical配置 |
 | run目录覆盖 | `--output-root PATH`是完整seed run root，不再自动追加seed |
 
-共享评测器及其依赖另行按该仓库文档准备。此处只说明Show-o2当前已实现路径选择，不把ControlAR/OmniGen2的新机迁移功能写成Show-o2能力。
+远程数据/共享评测器另行部署；环境与权重准备成功不表示这些路径已准备好。下例按远程常见 `~/task` 布局设置，若实际不同请替换；评测环境按共享评测器自己的README准备：
+
+```bash
+export DATA_ROOT="$HOME/task/UniLIP/data/csgo_benchmark_v2"
+export SHARED_EVAL_DIR="$HOME/task/csgo_benchmark_v2_eval_general"
+export EVAL_PYTHON="$SHARED_EVAL_DIR/.venv/bin/python"
+```
+
+本次只修改初始化，不改runner的路径优先级、不修改aligned YAML、预算/LoRA/采样策略或checkpoint合同。脚本不会把新机器的环境差异伪装成原机器的精确复现；旧run恢复若被身份校验拒绝，不可改写metadata绕过。
 
 ## 5. 手动训练、恢复、推理与评测
 
-以下命令由用户手动执行。可追加 `--dry-run` 只打印解析后的命令、不启动模型或写run。没有一键 `all` action；`--task all`只是同时选择离散/连续两个任务。现有任务运行时，不再启动写入同一目录的进程。
+以下命令由用户按需手动执行，不要求先运行额外的检查或smoke命令。训练与恢复二选一；训练结束后再推理和评测。推理、评测默认同时处理离散和连续两个任务。现有任务运行时，不再启动写入同一目录的进程。
 
 ### 5.1 最终 aligned_v2_final
 
 ```bash
-cd /home/jiahao/task/Show-o
+cd ~/task/Show-o  # 两台服务器都使用各自实际仓库路径
 
 # 首次训练：默认全部可见GPU，micro8，累计自动使有效batch=128。
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned
@@ -147,36 +227,18 @@ bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --resume latest
 ```
 
-指定设备/拆分的首次启动替代示例（不能与上面首次训练重复写同一run；最终版micro8、多GPU实训尚待验收）：
+正式结束后，同一冻结late生成两个测试集。以下省略值均来自当前runner/config：checkpoint=late、task=all、推理seed42、batch16；训练seed默认并限定42：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned \
-  --num-processes 1 --micro-batch 8 --gradient-accumulation 16
-
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_csgo_seen10.sh train \
-  --experiment csgo_seen10_exp32gen_aligned \
-  --num-processes 2 --micro-batch 8 --gradient-accumulation 8
-```
-
-正式结束后，同一冻结late生成两个测试集；推理seed固定42，训练seed默认并限定42：
-
-```bash
-bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned \
-  --checkpoint late --task discrete --inference-seed 42 --batch-size 16
-bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned \
-  --checkpoint late --task continuous --inference-seed 42 --batch-size 16
-bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned \
-  --checkpoint late --task all
+bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned
+bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned
 
 # best仅作补充，独立预测/评测目录。
-bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned \
-  --checkpoint best --task all --inference-seed 42 --batch-size 16
-bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned \
-  --checkpoint best --task all
+bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned --checkpoint best
+bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned --checkpoint best
 ```
 
-runner省略checkpoint仍默认best，因此论文主结果必须显式指定late。无需OmniGen2那样的convert步骤，直接加载当前policy的LoRA/full权重。
+runner对aligned默认选择late，legacy仍默认best。无需OmniGen2那样的convert步骤，直接加载当前policy的LoRA/full权重。若仅运行一个测试集，可指定 `--task discrete` 或 `--task continuous`；设备和batch拆分仍可覆盖，默认行为不变。
 
 ### 5.2 保留 aligned_v1
 
@@ -185,8 +247,8 @@ runner省略checkpoint仍默认best，因此论文主结果必须显式指定lat
 ```bash
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1 --resume latest
-bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1 --checkpoint late --task all
-bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1 --checkpoint late --task all
+bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1
+bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned --finetuning-policy aligned_v1
 ```
 
 这些是保留旧实验的操作入口，不是最终方案的推荐新训练命令。
@@ -196,15 +258,15 @@ bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned -
 历史seed0已训练结束且存在未完成预测，下面是复现/恢复入口，不要直接对已完成run重启训练，也不要把它作为aligned结果：
 
 ```bash
-bash scripts/run_csgo_seen10.sh train --seed 0
-bash scripts/run_csgo_seen10.sh train --seed 0 --resume latest
-bash scripts/run_csgo_seen10.sh infer --seed 0 --checkpoint best --task all
-bash scripts/run_csgo_seen10.sh eval --seed 0 --task all
+bash scripts/run_csgo_seen10.sh train
+bash scripts/run_csgo_seen10.sh train --resume latest
+bash scripts/run_csgo_seen10.sh infer
+bash scripts/run_csgo_seen10.sh eval
 ```
 
 不传experiment继续使用numeric-FiLM、seed0和旧目录；推理默认batch16，`--batch-size 8`等覆盖仍兼容。legacy的best/late不分预测根，不可混用两个checkpoint续写同一预测目录。
 
-直接Python入口仍为 `show-o2/train_seen10.py` 与 `show-o2/infer_seen10.py`；使用嵌套venv和明确config/data/output/checkpoint参数。日常优先runner，添加 `--dry-run` 可获得当前版本完整直接命令，避免维护第二份重复命令。
+直接Python入口仍为 `show-o2/train_seen10.py` 与 `show-o2/infer_seen10.py`。日常只需使用以上runner命令，不需要手动激活venv或维护第二份直接Python命令。旧初始化入口默认local以及原有检查参数继续兼容，但不作为日常操作步骤。
 
 ## 6. 推理加速、输出隔离与共享评测
 
@@ -258,26 +320,13 @@ aligned两split绑定同一checkpoint内容hash；policy/config、数据manifest
 
 先完成20,000/12,800图片及identity/coverage检查，再运行正式eval。少量smoke及连续frame-only不等于FID/FVD或时序指标验收，也不构成正式结果。
 
-## 7. 检查与隔离 smoke
+## 7. 验收范围说明（不是额外操作步骤）
 
-这次文档整理不会执行下面的模型检查。先做不写run的命令检查：
+本文只保留日常初始化、训练、恢复、推理和评测命令，不要求用户另行执行检查或smoke。版本/导入/权重校验已内置初始化；数据、checkpoint身份、输出完整性等保护仍由各执行流程内部实施，不因精简文档而关闭。
 
-```bash
-bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --dry-run
-bash scripts/run_csgo_seen10.sh infer --experiment csgo_seen10_exp32gen_aligned --checkpoint late --task all --dry-run
-bash scripts/run_csgo_seen10.sh eval --experiment csgo_seen10_exp32gen_aligned --checkpoint late --task all --dry-run
-```
+完整模型验收标准仍见 [方案文档](CSGO_SEEN10_PLAN.md)，已测与未测证据见 [验收记录](CSGO_ALIGNED_VALIDATION.md)。最终版全尺寸GPU显存/吞吐、多卡训练及同布局精确恢复仍未全部实测；简化操作不等于这些检查已经通过，也不把初始化成功当作远程A100端到端模型验收。
 
-GPU空闲、用户准备好后运行隔离smoke（会实际训练/推理并调用共享评测器）：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_csgo_seen10.sh smoke \
-  --experiment csgo_seen10_exp32gen_aligned --num-processes 1
-```
-
-aligned写入 `<seed_run_root>_smoke_runs/<UTC timestamp>-<pid>/`，不创建/续写正式seed根；legacy为原run下 `smoke_runs/<timestamp>/`。aligned smoke使用有效batch128完成1个optimizer update、2条验证、离散/连续各1张和共享evaluator smoke；它**不自动执行2步精确恢复对照**，连续评测仅frame-only。
-
-完整验收还须按 [方案文档](CSGO_SEEN10_PLAN.md) 做同布局2步/新进程resume对照及最终版全分辨率显存/吞吐测量。真实权重CPU审计、tiny恢复、历史v1对照的命令和产物见 [验收记录](CSGO_ALIGNED_VALIDATION.md)。aligned实施请求中的`RUN_FORMAL=0`表示不自动启动正式实验，不是runner选项；通过smoke也不自动启动正式训练/全量生成/评测，正式命令由用户手动执行。
+原有隔离smoke能力继续保留，但不加入日常执行链，也不由初始化自动触发。`RUN_FORMAL=0`是此前实施阶段不自动启动正式实验的边界，不是runner选项；正式训练/全量生成/评测仍由用户手动执行。
 
 ## 8. 状态快照与未完成项
 
@@ -296,3 +345,15 @@ legacy证据：[loss.jsonl](outputs/csgo_benchmark_v2_seen10/Show-o2-1.5B/seed_0
 最终版micro8显存、batch16吞吐、全模型GPU精确恢复和完整指标尚待验证，不复用旧v1资源数字给出ETA。后续由用户手动验收与启动；本次仅整理文档，未下载权重、修改实现或触碰已有结果。
 
 本次整理核对了文档本地链接、Bash代码块语法及三版本runner的代表性dry-run；149个代码/脚本/配置/依赖文件整理前后的SHA256完全一致。既有47项模型相关回归记录仍属于前次实施验收，没有在文档整理中重跑。
+
+### 8.1 双服务器初始化增补：2026-09-28
+
+第4节现已提供local/remote两个初始化入口，旧入口无参兼容local。本地现有环境的CPU依赖/版本检查通过；16项初始化mock/CPU测试与6项旧runner回归共22项通过，另检查了Shell语法、文档链接和Bash示例。记录见 [本轮pytest.xml](outputs/setup_env_verification_20260928.AaoZBU/pytest.xml)，范围说明见 [验收记录](CSGO_ALIGNED_VALIDATION.md)。
+
+本轮模型/数据/训练/推理/config与runner的45个受保护文件SHA256未变，公共依赖有效条目、权重下载实现和官方资产revision/URL/大小/SHA也未变。没有安装或重装真实环境、下载大依赖/权重、执行GPU检查或启动正式实验。尚未在远程A100实际运行安装与模型smoke；模拟安装测试不等于远程实机验收。
+
+### 8.2 初始化命令精简：2026-09-28
+
+按后续要求，第4.2/4.3分别列出本地/远程的环境、权重分步命令，第4.4单列可选的一键合并命令；不要求额外的手动检查、修复或smoke步骤。环境配置/合并模式自动识别并备份重建严格为空的失败继承venv；仅下载和只读模式不修复环境。原有高级参数兼容，模型与实验配置不变。
+
+主代理运行34项初始化测试及6项旧runner回归，共40项通过；11个Bash代码块语法、14条运行命令的只解析测试与文档本地链接通过。未真实安装/替换环境、下载权重、执行GPU操作或启动正式实验；远程实机验收仍未完成。详细范围见 [验收记录](CSGO_ALIGNED_VALIDATION.md)。

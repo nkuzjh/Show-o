@@ -12,6 +12,49 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 REQUIREMENTS_FILE="${SHOWO2_DIR}/requirements-csgo-seen10.txt"
 
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+profile=local
+mode=full
+dry_run=0
+repair=0
+profile_seen=0
+mode_seen=0
+usage() {
+    printf 'Usage: %s [--profile local|remote] [--env-only|--assets-only|--check|--check-cuda] [--dry-run] [--repair-incomplete-venv]\n' "$0"
+    printf 'No options: prepare the Python environment and verified model weights/assets.\n'
+    printf 'For one-command host setup, use setup_csgo_seen10_local.sh or setup_csgo_seen10_remote.sh.\n'
+    printf '%s\n' '--repair-incomplete-venv is retained for compatibility; safe bootstrap-only venv recovery is automatic.'
+}
+while (( $# )); do
+    case "$1" in
+        --profile)
+            (( $# >= 2 )) || { usage >&2; exit 2; }
+            (( profile_seen == 0 )) || { printf 'Duplicate --profile\n' >&2; exit 2; }
+            profile="$2"; profile_seen=1; shift 2 ;;
+        --env-only|--assets-only|--check|--check-cuda)
+            (( mode_seen == 0 )) || { printf 'Conflicting mode options\n' >&2; exit 2; }
+            mode="${1#--}"; mode_seen=1; shift ;;
+        --dry-run) dry_run=1; shift ;;
+        --repair-incomplete-venv) repair=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+[[ "$profile" == local || "$profile" == remote ]] || die "Unknown profile: ${profile}"
+[[ -f "$REQUIREMENTS_FILE" ]] || die "Requirements file not found: ${REQUIREMENTS_FILE}"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable not found: ${PYTHON_BIN}"
+env_args=(--project-dir "$SHOWO2_DIR" --profile "$profile" --mode "$mode")
+(( dry_run == 0 )) || env_args+=(--dry-run)
+(( repair == 0 )) || env_args+=(--repair-incomplete-venv)
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" "$SCRIPT_DIR/csgo_seen10_env.py" "${env_args[@]}"
+if [[ "$mode" == env-only || "$mode" == check || "$mode" == check-cuda ]]; then
+    exit 0
+fi
+
 SHOWO_REVISION="07ec16589d4fc5422a74dddbbc4b2cd11e551039"
 SHOWO_WEIGHT_URL="https://huggingface.co/showlab/show-o2-1.5B/resolve/${SHOWO_REVISION}/pytorch_model.bin"
 SHOWO_WEIGHT_PATH="${SHOWO_MODEL_DIR}/pytorch_model.bin"
@@ -22,11 +65,6 @@ WAN_VAE_URL="https://huggingface.co/Wan-AI/Wan2.1-T2V-14B/resolve/main/Wan2.1_VA
 WAN_VAE_PATH="${CHECKPOINT_DIR}/Wan2.1_VAE.pth"
 WAN_VAE_SIZE="507609880"
 WAN_VAE_SHA256="38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981"
-
-die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
 
 verify_file_or_die() {
     local path="$1"
@@ -130,45 +168,11 @@ download_verified_asset() {
 
 check_existing_asset "$SHOWO_WEIGHT_PATH" "$SHOWO_WEIGHT_SIZE" "$SHOWO_WEIGHT_SHA256" "Show-o2-1.5B weights"
 check_existing_asset "$WAN_VAE_PATH" "$WAN_VAE_SIZE" "$WAN_VAE_SHA256" "Wan2.1 VAE"
-
-command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable not found: ${PYTHON_BIN}"
-[[ -f "$REQUIREMENTS_FILE" ]] || die "Requirements file not found: ${REQUIREMENTS_FILE}"
-
-mkdir -p -- "$CHECKPOINT_DIR" "$SHOWO_MODEL_DIR" "$CACHE_DIR"
-if [[ -x "$VENV_PYTHON" ]]; then
-    printf 'Reusing existing venv: %s\n' "$VENV_DIR"
-elif [[ -e "$VENV_DIR" || -L "$VENV_DIR" ]]; then
-    die "${VENV_DIR} exists but has no executable bin/python; refusing to replace it."
-else
-    "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
+if (( dry_run )); then
+    printf 'DRY RUN: would prepare missing assets under %s\n' "$CHECKPOINT_DIR"
+    exit 0
 fi
-
-verify_system_torch() {
-    "$VENV_PYTHON" - "$VENV_DIR" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-import torch
-
-venv_dir = Path(sys.argv[1]).resolve()
-venv_cfg = (venv_dir / "pyvenv.cfg").read_text(encoding="utf-8")
-if not re.search(r"^include-system-site-packages\s*=\s*true\s*$", venv_cfg, re.IGNORECASE | re.MULTILINE):
-    raise SystemExit("venv was not created with --system-site-packages")
-torch_path = Path(torch.__file__).resolve()
-if torch_path.is_relative_to(venv_dir):
-    raise SystemExit(f"torch is installed inside the venv instead of inherited from the host: {torch_path}")
-if not torch.__version__.startswith("2.12.") or torch.version.cuda != "13.0":
-    raise SystemExit(
-        f"expected host torch 2.12+cu130, found torch {torch.__version__} / CUDA {torch.version.cuda}"
-    )
-print(f"Using host torch {torch.__version__} (CUDA {torch.version.cuda}) from {torch_path}")
-PY
-}
-
-verify_system_torch || die "The venv must inherit the host PyTorch 2.12+cu130; no torch package was installed."
-"$VENV_PYTHON" -m pip install --requirement "$REQUIREMENTS_FILE"
-verify_system_torch || die "Host PyTorch is not visible after dependency installation."
+mkdir -p -- "$CHECKPOINT_DIR" "$SHOWO_MODEL_DIR" "$CACHE_DIR"
 
 export HF_HOME="$CACHE_DIR"
 export HF_HUB_CACHE="${CACHE_DIR}/hub"

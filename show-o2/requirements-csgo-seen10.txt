@@ -1,5 +1,5 @@
-# Install inside show-o2/.venv. PyTorch is supplied by the host system through
-# --system-site-packages; do not add a torch/CUDA wheel here.
+# Install inside show-o2/.venv. The profile setup installs or verifies its
+# PyTorch wheel separately and constrains dependency resolution.
 transformers==4.47.0
 diffusers==0.31.0
 timm==1.0.12

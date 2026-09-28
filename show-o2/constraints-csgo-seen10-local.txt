@@ -1,0 +1,4 @@
+# Constrain dependency resolution without forcing replacement of matching host wheels.
+# Module versions and CUDA runtime are checked by scripts/csgo_seen10_env.py.
+torch==2.12.0
+torchvision==0.27.0

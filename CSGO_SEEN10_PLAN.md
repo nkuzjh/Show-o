@@ -169,7 +169,7 @@ Transformer 内部的 attention、MLP 与 AdaLN Linear 一律归属于该 Transf
 | `show-o2/infer_seen10.py`、`show-o2/csgo_seen10/runtime.py` | 独立采样 RNG、批量/缓存/Euler、JPEG 完整性、checkpoint/预测身份 |
 | `show-o2/models/modeling_showo2_qwen2_5.py` | 图像生成跳过词表 logits、原生视觉/生成计算路径 |
 | `scripts/run_csgo_seen10.sh` | legacy/v1/v2 路由、训练/推理/共享评测命令、dry-run 与隔离 smoke |
-| `scripts/setup_csgo_seen10.sh`、`show-o2/requirements-csgo-seen10.txt` | 本机依赖与官方资产准备；不等同于通用跨服务器迁移工具 |
+| `scripts/setup_csgo_seen10{,_local,_remote}.sh`、环境helper及依赖/约束文件 | local cu130 / remote cu124 两套初始化入口，共享官方资产；环境检查与受限空venv修复，不改实验合同 |
 | `scripts/audit_aligned_parameters.py`、`scripts/verify_aligned_resume.py` | CPU 真权重审计/缩小图 backward、可信 checkpoint 的只读恢复对比 |
 | `tests/test_csgo_aligned_*.py` 与原有 tests | 参数/LoRA、数据、source stream、恢复、启动器和旧行为回归 |
 
@@ -189,3 +189,11 @@ Transformer 内部的 attention、MLP 与 AdaLN Linear 一律归属于该 Transf
 已完成和未完成项以 [日期化验收记录](CSGO_ALIGNED_VALIDATION.md) 为证；最终版目前只有 CPU 回归、真实权重缩小图 backward 与 tiny 精确恢复，尚未完成全尺寸 GPU 端到端验收。常规 `smoke` 命令只跑1个 update及每任务1张图，不能单独满足上面的2步恢复对照要求。
 
 最终版从79.45M增加到336.48M可训练参数，并增加视觉反向、文本 embedding 和对应 Adam 状态。历史 v1 的耗时、显存或 checkpoint 体积不得作为 v2 估算；最终版正式 ETA/磁盘预算待全尺寸短测后给出。micro8 是否可运行未验证，OOM 时减 micro、增 accumulation 保持128。双图长序列、确定性 backend 开销、432→448尺寸差异和 BF16跨 batch 数值差异需要披露。
+
+## 7. 本地 / 远程环境初始化边界（2026-09-28）
+
+- 本地Blackwell/580驱动维持PyTorch2.12.0+cu130、torchvision0.27.0+cu130；远程A100/550驱动使用PyTorch2.6.0+cu124、torchvision0.21.0+cu124，两机保留各自Python3.13。不能直接把cu130给远程使用，也不把cu124当作本地Blackwell受支持配置。未为了版本统一而升级驱动或迁移本地已验证环境。
+- 两个薄入口共用初始化和下载实现，用户按机器二选一；主文档同时列出分步环境/权重命令和无参一键合并命令，任选一种流程，不增加手动检查步骤。旧setup无参保留local含义。remote隔离安装torch，不再要求Conda base预装；local可复用已符合版本的宿主继承环境。依赖安装锁定torch/vision组合，健康环境不自动切换profile。
+- 版本/导入/权重校验由脚本内部完成；环境配置或合并模式默认对严格确认仅含初始化组件且缺torch的失败继承venv自动先备份后重建，不需要额外修复参数。非空、版本不符或异常环境不自动覆盖。旧检查/修复参数只保留兼容；只读或仅下载模式不得触发自动修复，且仅下载模式要求环境已准备好。登录节点可安装和下载，不自动运行GPU模型检查。
+- 不修改模型/数据/训练/推理/共享指标、aligned配方或正式产物；不承诺跨torch/CUDA版本的bitwise resume。初始化不自动启动GPU smoke或正式实验，日常文档不要求用户额外运行验证命令；模型未验收项仍如实保留。
+- 命令统一维护在主文档第4节；验收覆盖CLI/无写入检查、mock安装和安全保护、本地只读导入。没有访问远程服务器、实际安装远程大依赖或远程GPU测试时，不声称已在A100完整跑通。
