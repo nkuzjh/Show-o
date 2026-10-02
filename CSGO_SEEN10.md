@@ -223,8 +223,23 @@ cd ~/task/Show-o  # 两台服务器都使用各自实际仓库路径
 # 首次训练：默认全部可见GPU，micro8，累计自动使有效batch=128。
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned
 
+nohup bash scripts/run_csgo_seen10.sh train \
+  --experiment csgo_seen10_exp32gen_aligned \
+  --num-processes 1 \
+  --micro-batch 16 \
+  --gradient-accumulation 8 \
+  >showo2_aligned.nohup.out1 2>&1 &
+
 # 同一run的最近完整checkpoint恢复；保持原GPU布局与batch拆分。
 bash scripts/run_csgo_seen10.sh train --experiment csgo_seen10_exp32gen_aligned --resume latest
+
+nohup bash scripts/run_csgo_seen10.sh train \
+  --experiment csgo_seen10_exp32gen_aligned \
+  --num-processes 1 \
+  --resume latest \
+  --micro-batch 16 \
+  --gradient-accumulation 8 \
+  >>showo2_aligned.nohup.out1 2>&1 &
 ```
 
 正式结束后，同一冻结late生成两个测试集。以下省略值均来自当前runner/config：checkpoint=late、task=all、推理seed42、batch16；训练seed默认并限定42：
